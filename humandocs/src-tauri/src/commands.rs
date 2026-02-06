@@ -163,11 +163,16 @@ pub async fn is_paired(state: tauri::State<'_, AppState>) -> Result<bool, String
 
     match HumanSync::init(config).await {
         Ok(node) => {
-            // Restore the server peer into the registry so sync works after restart
+            // Restore the server peer into the registry so sync works after restart.
+            // The _devices doc on disk may already have this, but we add it as a
+            // fallback in case the doc hasn't been synced yet.
             if let Some(ref server_nid) = app_cfg.server_node_id {
                 if let Ok(nid) = server_nid.parse::<humansync::NodeId>() {
-                    node.registry()
-                        .add(humansync::registry::DeviceInfo::new(nid, "Server"));
+                    if !node.registry().contains(&nid) {
+                        let _ = node.registry()
+                            .add(humansync::registry::DeviceInfo::new(nid, "Server"));
+                        let _ = node.registry().save();
+                    }
                 }
             }
             *guard = Some(Arc::new(node));

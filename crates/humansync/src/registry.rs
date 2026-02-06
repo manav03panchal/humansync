@@ -372,6 +372,38 @@ impl DeviceRegistryStore {
         *self.dirty.read()
     }
 
+    /// Reload the registry from the on-disk `_devices.automerge` file.
+    ///
+    /// This is called after sync cycles to pick up changes that were
+    /// merged into the `_devices` doc during normal doc sync.
+    pub fn reload_from_disk(&self) -> Result<()> {
+        if !self.doc_path.exists() {
+            return Ok(());
+        }
+
+        let bytes = std::fs::read(&self.doc_path)
+            .map_err(|e| Error::storage(format!("failed to read devices document: {e}")))?;
+
+        match AutoCommit::load(&bytes) {
+            Ok(loaded_doc) => {
+                let devices = Self::extract_devices_from_doc(&loaded_doc)?;
+                self.registry.load_from_doc(devices);
+                *self.doc.write() = loaded_doc;
+                *self.dirty.write() = false;
+                debug!(
+                    path = %self.doc_path.display(),
+                    count = self.registry.len(),
+                    "Reloaded device registry from disk"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to load _devices document, skipping reload");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Save the registry to disk
     pub fn save(&self) -> Result<()> {
         let mut doc = self.doc.write();

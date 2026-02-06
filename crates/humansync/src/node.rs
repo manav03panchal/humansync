@@ -55,9 +55,10 @@ use crate::config::Config;
 use crate::doc::Document;
 use crate::error::{Error, Result};
 use crate::identity::load_or_create_identity;
-use crate::registry::DeviceRegistry;
+use crate::registry::DeviceRegistryStore;
 use crate::store::Store;
 use crate::sync::automerge::{request_doc_list, sync_docs};
+use crate::sync::{handle_blob_request, handle_doc_list_request, run_sync_protocol};
 use crate::ALPN;
 
 /// Status information about the sync state.
@@ -176,8 +177,8 @@ pub struct HumanSync {
     state: Arc<RwLock<NodeState>>,
     /// Document and blob store
     store: Arc<Store>,
-    /// Device registry
-    registry: Arc<DeviceRegistry>,
+    /// Device registry (persistent, backed by `_devices` Automerge doc)
+    registry: Arc<DeviceRegistryStore>,
     /// Sync status
     sync_status: Arc<RwLock<SyncStatus>>,
 }
@@ -224,8 +225,11 @@ impl HumanSync {
             .map_err(|e| Error::init(format!("failed to initialize blob store: {e}")))?;
         debug!("Blob store initialized");
 
-        // Initialize device registry
-        let registry = Arc::new(DeviceRegistry::new());
+        // Initialize device registry (persistent, loads _devices doc from disk if exists)
+        let registry = Arc::new(
+            DeviceRegistryStore::new(&config.storage_path)
+                .map_err(|e| Error::init(format!("failed to initialize device registry: {e}")))?,
+        );
 
         // Create shutdown signal channel
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -244,6 +248,13 @@ impl HumanSync {
             registry: registry.clone(),
             sync_status: sync_status.clone(),
         };
+
+        // Start accept loop for incoming P2P connections
+        Self::start_accept_loop(
+            endpoint.clone(),
+            store.clone(),
+            registry.clone(),
+        );
 
         // Start background sync loop
         let sync_loop_handle = Self::start_sync_loop(
@@ -322,10 +333,9 @@ impl HumanSync {
             .server_node_id
             .parse()
             .map_err(|e| Error::pairing(format!("invalid server node_id: {e}")))?;
-        self.registry.add(crate::registry::DeviceInfo::new(
-            server_node_id,
-            "Server",
-        ));
+        self.registry
+            .add(crate::registry::DeviceInfo::new(server_node_id, "Server"))
+            .map_err(|e| Error::pairing(format!("failed to add server to registry: {e}")))?;
 
         // Add all returned devices to the local registry
         for device in &pair_response.devices {
@@ -338,12 +348,19 @@ impl HumanSync {
             };
             // Skip if already added (e.g., the server itself)
             if !self.registry.contains(&device_node_id) {
-                self.registry.add(crate::registry::DeviceInfo::new(
+                if let Err(e) = self.registry.add(crate::registry::DeviceInfo::new(
                     device_node_id,
                     &device.name,
-                ));
+                )) {
+                    warn!(node_id = %device.node_id, error = %e, "Failed to add device to registry");
+                }
             }
         }
+
+        // Persist registry to disk so it survives restarts
+        self.registry
+            .save()
+            .map_err(|e| Error::pairing(format!("failed to save device registry: {e}")))?;
 
         info!(
             server_node_id = %pair_response.server_node_id,
@@ -467,7 +484,7 @@ impl HumanSync {
     }
 
     /// Get a reference to the device registry
-    pub fn registry(&self) -> &DeviceRegistry {
+    pub fn registry(&self) -> &DeviceRegistryStore {
         &self.registry
     }
 
@@ -505,13 +522,167 @@ impl HumanSync {
         Ok(())
     }
 
+    /// Start an accept loop for incoming P2P connections.
+    ///
+    /// This allows other devices to connect to us directly (e.g., via mDNS on
+    /// the same LAN). Incoming connections are gated against the device registry.
+    fn start_accept_loop(
+        endpoint: Endpoint,
+        store: Arc<Store>,
+        registry: Arc<DeviceRegistryStore>,
+    ) {
+        tokio::spawn(async move {
+            info!("Client accept loop started");
+            loop {
+                let incoming = match endpoint.accept().await {
+                    Some(incoming) => incoming,
+                    None => {
+                        debug!("Endpoint closed, stopping accept loop");
+                        break;
+                    }
+                };
+
+                let conn = match incoming.await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        debug!(error = %e, "Failed to accept incoming connection");
+                        continue;
+                    }
+                };
+
+                let remote_node_id = match conn.remote_node_id() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        debug!(error = %e, "Incoming connection has no remote NodeId");
+                        continue;
+                    }
+                };
+
+                // Gate against device registry
+                if !registry.is_authorized(&remote_node_id) {
+                    debug!(remote = %remote_node_id, "Rejected connection from unknown device");
+                    continue;
+                }
+
+                info!(remote = %remote_node_id, "Accepted P2P connection");
+
+                let store = store.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = Self::handle_incoming_connection(conn, store).await {
+                        debug!(remote = %remote_node_id, error = %e, "Incoming connection handler finished");
+                    }
+                });
+            }
+            info!("Client accept loop stopped");
+        });
+    }
+
+    /// Handle an accepted incoming connection by routing streams to protocol handlers.
+    async fn handle_incoming_connection(
+        conn: iroh::endpoint::Connection,
+        store: Arc<Store>,
+    ) -> Result<()> {
+        loop {
+            let (send, mut recv) = match conn.accept_bi().await {
+                Ok(streams) => streams,
+                Err(_) => break, // Connection closed — normal
+            };
+
+            let mut tag = [0u8; 1];
+            if recv.read_exact(&mut tag).await.is_err() {
+                continue;
+            }
+
+            let store = store.clone();
+
+            match tag[0] {
+                crate::sync::BLOB_REQUEST_MSG => {
+                    tokio::spawn(async move {
+                        if let Some(blob_store) = store.blob_store() {
+                            let mut send = send;
+                            let mut recv = recv;
+                            let _ = handle_blob_request(&blob_store, &mut send, &mut recv).await;
+                        }
+                    });
+                }
+                crate::sync::DOC_LIST_REQUEST => {
+                    tokio::spawn(async move {
+                        if let Ok(doc_names) = store.list_docs("") {
+                            let _ = handle_doc_list_request(send, &doc_names).await;
+                        }
+                    });
+                }
+                first_byte => {
+                    // Doc sync — first byte is part of the doc name length prefix
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_incoming_doc_sync(store, send, recv, first_byte).await {
+                            debug!(error = %e, "Incoming doc sync finished");
+                        }
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle an incoming doc sync stream (same protocol as server-side `handle_doc_sync`).
+    async fn handle_incoming_doc_sync(
+        store: Arc<Store>,
+        send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+        first_byte: u8,
+    ) -> Result<()> {
+        // Read remaining 3 bytes of the 4-byte doc name length
+        let mut remaining_len = [0u8; 3];
+        recv.read_exact(&mut remaining_len)
+            .await
+            .map_err(|e| Error::sync(format!("failed to read doc name length: {e}")))?;
+
+        let name_len = u32::from_be_bytes([
+            first_byte,
+            remaining_len[0],
+            remaining_len[1],
+            remaining_len[2],
+        ]) as usize;
+
+        if name_len == 0 || name_len > 4096 {
+            return Err(Error::sync(format!("invalid doc name length: {name_len}")));
+        }
+
+        // Read the doc name
+        let mut name_buf = vec![0u8; name_len];
+        recv.read_exact(&mut name_buf)
+            .await
+            .map_err(|e| Error::sync(format!("failed to read doc name: {e}")))?;
+
+        let doc_name = String::from_utf8(name_buf)
+            .map_err(|e| Error::sync(format!("invalid doc name: {e}")))?;
+
+        debug!(doc = %doc_name, "Incoming doc sync");
+
+        // Open or create the local document
+        let local_doc = store.open_doc(&doc_name).await?;
+
+        // Run the sync protocol
+        run_sync_protocol(send, recv, &local_doc).await?;
+
+        // Save the synced document
+        store
+            .save_doc_with_index(&local_doc)
+            .await
+            .map_err(|e| Error::sync(format!("failed to save synced document: {e}")))?;
+
+        info!(doc = %doc_name, "Incoming doc sync completed");
+        Ok(())
+    }
+
     /// Start the background sync loop
     ///
     /// Returns a JoinHandle that can be used to wait for the task to complete.
     fn start_sync_loop(
         endpoint: Endpoint,
         store: Arc<Store>,
-        registry: Arc<DeviceRegistry>,
+        registry: Arc<DeviceRegistryStore>,
         sync_status: Arc<RwLock<SyncStatus>>,
         sync_interval_secs: u64,
         mut shutdown_rx: watch::Receiver<bool>,
@@ -552,7 +723,7 @@ impl HumanSync {
     async fn run_sync_cycle(
         endpoint: &Endpoint,
         store: &Arc<Store>,
-        registry: &Arc<DeviceRegistry>,
+        registry: &Arc<DeviceRegistryStore>,
         sync_status: &Arc<RwLock<SyncStatus>>,
     ) {
         debug!("Starting sync cycle");
@@ -584,7 +755,7 @@ impl HumanSync {
                 Ok(synced_count) => {
                     peers_connected += 1;
                     docs_synced += synced_count;
-                    registry.touch(&device.node_id);
+                    let _ = registry.touch(&device.node_id);
                     debug!(
                         peer = %device.node_id,
                         docs_synced = synced_count,
@@ -607,6 +778,12 @@ impl HumanSync {
             status.peers_connected = peers_connected;
             status.docs_pending = 0; // Reset after sync
             status.last_sync = Some(Utc::now());
+        }
+
+        // After syncing, reload the device registry from the _devices doc on disk.
+        // This picks up newly paired devices that were synced from the server.
+        if let Err(e) = registry.reload_from_disk() {
+            warn!(error = %e, "Failed to reload device registry after sync");
         }
 
         debug!(
@@ -829,7 +1006,7 @@ mod tests {
         // This tests that the sync loop runs and updates status
         let fake_node_id = SecretKey::generate(rand::thread_rng()).public();
         let device_info = DeviceInfo::new(fake_node_id, "Fake Device");
-        node.registry().add(device_info);
+        let _ = node.registry().add(device_info);
 
         // Wait for a sync cycle to run
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -876,7 +1053,7 @@ mod tests {
         // Add ourselves to the registry (should be skipped during sync)
         let self_node_id = node.node_id().unwrap();
         let device_info = DeviceInfo::new(self_node_id, "Self");
-        node.registry().add(device_info);
+        let _ = node.registry().add(device_info);
 
         // Trigger manual sync
         node.sync_now().await.unwrap();

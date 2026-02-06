@@ -3,7 +3,7 @@
 **Created:** 2026-02-05
 **Based on:** PRD v0.2
 **Duration:** 8 weeks
-**Last Updated:** 2026-02-06
+**Last Updated:** 2026-02-06 (session 2)
 
 ---
 
@@ -45,7 +45,7 @@ This plan breaks down the HumanSync MVP into actionable tasks across four 2-week
   - Generate keypair on first run
   - Store to `~/.humansync/device_key`
   - Load on subsequent runs
-- [ ] Enable mDNS discovery (`discovery_local_network()`)
+- [x] Enable mDNS discovery (`discovery_local_network()`)
 - [x] Enable n0 relay discovery (`discovery_n0()`)
 - [x] Test: two processes on same machine discover each other
 - [x] Test: two machines on same LAN discover each other
@@ -66,7 +66,7 @@ This plan breaks down the HumanSync MVP into actionable tasks across four 2-week
   - Exchange Automerge sync messages until converged
 - [x] Test: Device A edits, Device B receives within 5 seconds
 - [x] Test: Both devices edit offline, reconnect, merge correctly
-- [ ] Test: Sync works via mDNS (same LAN)
+- [~] Test: Sync works via mDNS (same LAN) — infrastructure implemented, pending real-device verification
 - [x] Test: Sync works via relay (different networks)
 
 #### Day 8-9: iroh-blobs Validation
@@ -85,7 +85,7 @@ This plan breaks down the HumanSync MVP into actionable tasks across four 2-week
 
 ### Week 1-2 Success Criteria
 - [x] Two devices sync an Automerge doc within 5 seconds
-- [ ] mDNS discovery works on LAN
+- [~] mDNS discovery works on LAN — enabled, peers discovered (verified in logs), P2P sync pending real-device test
 - [x] Relay fallback works across networks
 - [ ] Blob transfer works for files >100MB
 - [x] No showstopper issues with Iroh/Automerge APIs
@@ -156,9 +156,9 @@ This plan breaks down the HumanSync MVP into actionable tasks across four 2-week
 #### Day 16-17: Background Sync Loop
 - [x] Spawn background tokio task on `init()`
 - [x] Sync loop logic:
-  1. ~~mDNS discovers local peers (Iroh automatic)~~ (not yet)
-  2. Fetch peer list from server API
-  3. For each known peer:
+  1. mDNS discovers local peers (Iroh built-in, enabled)
+  2. Client accept loop handles incoming P2P connections
+  3. For each known peer (from `_devices` registry):
      - Check if in device registry
      - Connect via Iroh
      - Sync `_devices` doc first (registry updates)
@@ -250,7 +250,7 @@ This plan breaks down the HumanSync MVP into actionable tasks across four 2-week
   DELETE /devices/{node_id}
   ```
 - [x] Password verification (constant-time comparison)
-- [ ] Rate limiting on /pair endpoint (prevent brute force)
+- [x] Rate limiting on /pair endpoint (prevent brute force)
 - [x] Request logging
 
 #### Day 28-29: Docker Packaging
@@ -381,17 +381,17 @@ From PRD v0.2 Section 13:
 [x] 12. Edit same document on phone
 [x] 13. Turn wifi back on
 [x] 14. Both edits merged, no conflict, no data loss
-[ ] 15. Kill humansync-server
-[ ] 16. Edit on laptop
-[ ] 17. Edit on phone (both on same LAN)
-[ ] 18. Edits sync between laptop and phone directly              ← needs mDNS
-[ ] 19. Restart humansync-server
-[ ] 20. Server catches up with both devices' changes
+[~] 15. Kill humansync-server                                     ← code ready, needs 2-device test
+[~] 16. Edit on laptop                                            ← code ready, needs 2-device test
+[~] 17. Edit on phone (both on same LAN)                          ← code ready, needs 2-device test
+[~] 18. Edits sync between laptop and phone directly              ← mDNS + accept loop + persistent registry implemented
+[~] 19. Restart humansync-server                                  ← code ready, needs 2-device test
+[~] 20. Server catches up with both devices' changes              ← code ready, needs 2-device test
 [x] 21. Revoke phone via DELETE /devices/{node_id}
 [x] 22. Phone can no longer sync with laptop or server
 ```
 
-**Status: 16/22 verified, 6 remaining (mostly P2P/mDNS and formal end-to-end run)**
+**Status: 16/22 verified, 6 code-complete but need real 2-device test (P2P/mDNS steps 15-20)**
 
 ---
 
@@ -402,20 +402,33 @@ From PRD v0.2 Section 13:
 - [x] **Cursor activity tracking**: Added `activity` field to `CursorInfo` (typing/viewing)
 - [x] **Google Docs-style cursors**: Replaced cursor bar with floating caret overlays at actual text position
 
+## Features Added (Session 2026-02-06, part 2)
+
+- [x] **mDNS local discovery**: Enabled `discovery_local_network()` on both client and server Iroh endpoints
+- [x] **Rate limiting on /pair**: In-memory per-IP sliding window rate limiter (5 req/min, returns 429)
+- [x] **Client accept loop**: Client now accepts incoming P2P connections (gated by device registry)
+- [x] **Persistent device registry**: Client uses `DeviceRegistryStore` (Automerge-backed, survives restarts)
+- [x] **`_devices` doc sync propagation**: Server's `_devices.automerge` now lives in the sync directory so it propagates to clients via normal doc sync
+- [x] **Registry auto-refresh**: After each sync cycle, client reloads registry from `_devices` doc on disk — picks up newly paired devices automatically
+- [x] **Server self-registration**: Server adds itself to the `_devices` doc on startup
+
 ---
 
 ## Remaining Gaps
 
-| Item | Priority | Notes |
-|------|----------|-------|
-| **mDNS discovery** | High | Required for P2P without server (acceptance test steps 15-20). Need `discovery_local_network()` in Iroh endpoint builder. |
-| **Rate limiting on /pair** | Medium | Prevent brute force on pairing endpoint |
-| **100MB+ blob stress test** | Medium | Untested at scale |
-| **CI setup** | Medium | No GitHub Actions / CI pipeline yet |
-| **API documentation** | Low | Rustdoc for public humansync API |
-| **Self-hosted relay** | Low | Optional, n0 relays work for now |
-| **Formal 22-step test run** | High | Need to run complete acceptance test end-to-end |
-| **Release build** | Medium | No optimized/signed build yet |
+| Item | Priority | Status | Notes |
+|------|----------|--------|-------|
+| ~~mDNS discovery~~ | ~~High~~ | **DONE** | Enabled on client + server. Peers discover each other (verified in logs). |
+| ~~Rate limiting on /pair~~ | ~~Medium~~ | **DONE** | In-memory per-IP, 5 req/min, 429 on exceed. |
+| ~~P2P sync (no server)~~ | ~~High~~ | **DONE** | Client accept loop + persistent registry + `_devices` doc propagation. Needs 2-device verification. |
+| **2-device end-to-end test** | **High** | Blocked | Need a second physical device or VM to verify P2P steps 15-20. |
+| **100MB+ blob stress test** | Medium | Open | Untested at scale |
+| **CI setup** | Medium | Open | No GitHub Actions / CI pipeline yet |
+| **API documentation** | Low | Open | Rustdoc for public humansync API |
+| **Self-hosted relay** | Low | Open | Optional, n0 relays work for now |
+| **Release build** | Medium | Open | No optimized/signed build yet |
+| **Error handling polish** | Low | Open | User-friendly error messages in UI |
+| **Loading states** | Low | Open | Spinner/loading during sync operations |
 
 ---
 

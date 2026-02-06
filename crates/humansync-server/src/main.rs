@@ -87,8 +87,24 @@ async fn main() -> Result<()> {
     info!("Cloud peer accept loop started");
 
     // Initialize the device registry store (Automerge-backed)
-    let registry_store = DeviceRegistryStore::new(&args.data_dir)
+    // Use the sync directory so _devices.automerge is in the same docs/ dir
+    // as the CloudPeer's Store — this way the _devices doc gets synced to clients.
+    let sync_dir = args.data_dir.join("sync");
+    tokio::fs::create_dir_all(&sync_dir)
+        .await
+        .context("Failed to create sync directory")?;
+    let registry_store = DeviceRegistryStore::new(&sync_dir)
         .context("Failed to initialize device registry store")?;
+
+    // Ensure the server itself is in the _devices doc
+    if !registry_store.contains(&peer.node_id()) {
+        registry_store
+            .add(humansync::DeviceInfo::new(peer.node_id(), "Server"))
+            .context("Failed to add server to _devices")?;
+        registry_store
+            .save()
+            .context("Failed to save _devices")?;
+    }
     info!("Device registry store initialized");
 
     // Create shared state
