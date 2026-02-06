@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/humansync",
+    "crates/humansync-server",
+    "humandocs/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["HumanCorp"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/humancorp/humansync"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+

@@ -1,0 +1,15 @@
+services:
+  humansync-server:
+    build: .
+    ports:
+      - "4433:4433/udp"
+      - "8080:8080"
+    environment:
+      - HUMANSYNC_PASSWORD=changeme
+      - HUMANSYNC_DATA_DIR=/data
+    volumes:
+      - humansync-data:/data
+    restart: unless-stopped
+
+volumes:
+  humansync-data:

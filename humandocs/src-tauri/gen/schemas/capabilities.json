@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capability for Humandocs — allows all window and shell plugin access","local":true,"windows":["main"],"permissions":["core:default","shell:allow-open"]}}
