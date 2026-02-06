@@ -29,6 +29,7 @@ export default function DocumentEditor({
   const [cursors, setCursors] = useState<CursorInfo[]>([]);
   const deviceIdRef = useRef<string>('');
   const [_scrollTop, setScrollTop] = useState(0);
+  const [, setResizeKey] = useState(0);
 
   // Get device ID on mount
   useEffect(() => {
@@ -73,6 +74,13 @@ export default function DocumentEditor({
       textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
     }
   }, [content]);
+
+  // Recalculate cursor positions on window resize
+  useEffect(() => {
+    const handleResize = () => setResizeKey((k) => k + 1);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   // Report cursor position to backend
   useEffect(() => {
@@ -200,8 +208,10 @@ export default function DocumentEditor({
             placeholder="Start writing..."
           />
 
-          {textareaRef.current && cursors.map((c) => {
-            const coords = getCaretCoordinates(textareaRef.current!, c.position);
+          {cursors.map((c) => {
+            const ta = textareaRef.current;
+            if (!ta) return null;
+            const coords = getCaretCoordinates(ta, c.position);
             return (
               <div
                 key={c.device_id}

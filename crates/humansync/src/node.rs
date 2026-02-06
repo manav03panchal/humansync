@@ -811,11 +811,14 @@ impl HumanSync {
 
         let node_addr = NodeAddr::new(*peer_node_id);
 
-        // Connect to the peer
-        let conn = endpoint
-            .connect(node_addr, ALPN)
-            .await
-            .map_err(|e| Error::sync(format!("failed to connect to peer: {e}")))?;
+        // Connect to the peer with a short timeout to avoid blocking on dead peers
+        let conn = tokio::time::timeout(
+            Duration::from_secs(3),
+            endpoint.connect(node_addr, ALPN),
+        )
+        .await
+        .map_err(|_| Error::sync("failed to connect to peer: timed out"))?
+        .map_err(|e| Error::sync(format!("failed to connect to peer: {e}")))?;
 
         debug!(peer = %peer_node_id, "Connected to peer");
 

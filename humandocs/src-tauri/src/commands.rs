@@ -113,7 +113,7 @@ pub async fn init_app(
 ) -> Result<(), String> {
     let storage = storage_path(&state.data_dir);
 
-    let config = Config::new(&storage).with_server_url(&server_url);
+    let config = Config::new(&storage).with_server_url(&server_url).with_sync_interval(1);
 
     let node = HumanSync::init(config)
         .await
@@ -159,7 +159,7 @@ pub async fn is_paired(state: tauri::State<'_, AppState>) -> Result<bool, String
         return Ok(false);
     };
 
-    let config = Config::new(&app_cfg.storage_path).with_server_url(&app_cfg.server_url);
+    let config = Config::new(&app_cfg.storage_path).with_server_url(&app_cfg.server_url).with_sync_interval(1);
 
     match HumanSync::init(config).await {
         Ok(node) => {

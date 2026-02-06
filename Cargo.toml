@@ -19,3 +19,4 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 all = "warn"
 
+

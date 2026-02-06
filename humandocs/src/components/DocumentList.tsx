@@ -52,7 +52,6 @@ export default function DocumentList({ documents, activeDocId, onSelect }: Docum
               <div className="doc-title">{doc.title || 'Untitled'}</div>
               <div className="doc-meta">
                 <span className="doc-time">{timeAgo(doc.updated_at)}</span>
-                <span className="doc-preview">No additional text</span>
               </div>
             </div>
           ))
