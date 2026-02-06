@@ -38,6 +38,7 @@ impl CloudPeer {
             .secret_key(secret_key)
             .alpns(vec![ALPN.to_vec()])
             .discovery_n0()
+            .discovery_local_network()
             .bind()
             .await
             .context("Failed to bind Iroh endpoint")?;

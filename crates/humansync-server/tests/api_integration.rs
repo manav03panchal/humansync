@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::Router;
 use http_body_util::BodyExt;
 use humansync::DeviceRegistryStore;
 use humansync_server::{api, db::Database, AppState};
@@ -250,4 +251,77 @@ async fn test_revoke_device_wrong_password() {
 
     // Device should still exist
     assert!(state.db.contains(&device_node_id).unwrap());
+}
+
+/// Helper: build a pair request with the given password
+fn pair_request(device_node_id: &NodeId, password: &str) -> Request<Body> {
+    let pair_body = serde_json::json!({
+        "node_id": device_node_id.to_string(),
+        "device_name": "Test Laptop",
+        "password": password,
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/pair")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&pair_body).unwrap()))
+        .unwrap()
+}
+
+/// Helper: send a pair request through a cloned router and return the status code
+async fn pair_status(app: &Router, device_node_id: &NodeId, password: &str) -> StatusCode {
+    let req = pair_request(device_node_id, password);
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn test_pair_rate_limit_allows_up_to_max() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let state = test_state(temp_dir.path());
+    let device_node_id = test_node_id(1);
+    let app = api::router(state);
+
+    // The first 5 requests should all succeed (or fail with UNAUTHORIZED for
+    // wrong password -- either way they should NOT be 429).
+    for i in 0..5 {
+        let status = pair_status(&app, &device_node_id, "wrong-password").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "Request {i} should have been UNAUTHORIZED, not rate-limited"
+        );
+    }
+
+    // The 6th request should be rate-limited
+    let status = pair_status(&app, &device_node_id, "wrong-password").await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "Request 6 should have been rate-limited"
+    );
+}
+
+#[tokio::test]
+async fn test_pair_rate_limit_returns_429_body() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let state = test_state(temp_dir.path());
+    let device_node_id = test_node_id(1);
+    let app = api::router(state);
+
+    // Exhaust the rate limit
+    for _ in 0..5 {
+        pair_status(&app, &device_node_id, "wrong-password").await;
+    }
+
+    // The next request should return 429 with a descriptive body
+    let req = pair_request(&device_node_id, "wrong-password");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let body = body_bytes(resp.into_body()).await;
+    let body_str = String::from_utf8(body).unwrap();
+    assert!(
+        body_str.contains("Too many pairing attempts"),
+        "Expected rate limit message in body, got: {body_str}"
+    );
 }

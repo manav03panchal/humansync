@@ -1,28 +1,115 @@
 //! HTTP API for device pairing and management
 
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, FromRequestParts, Path, State},
     http::StatusCode,
     routing::{delete, get, post},
     Json, Router,
 };
 use iroh::NodeId;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::AppState;
 
+/// Extractor for the client's IP address.
+///
+/// Reads from `ConnectInfo<SocketAddr>` request extensions when available
+/// (i.e. when the server is started with `into_make_service_with_connect_info`).
+/// Falls back to `127.0.0.1` when unavailable (e.g. in test environments).
+struct ClientIp(IpAddr);
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        Ok(ClientIp(ip))
+    }
+}
+
+/// Maximum number of pairing attempts per IP within the time window.
+const RATE_LIMIT_MAX_REQUESTS: usize = 5;
+
+/// Sliding window duration for rate limiting (in seconds).
+const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
+/// In-memory rate limiter that tracks request timestamps per IP address.
+///
+/// Uses a sliding window approach: for each incoming request, expired entries
+/// (older than `RATE_LIMIT_WINDOW_SECS`) are pruned, and then the current
+/// count is checked against `RATE_LIMIT_MAX_REQUESTS`.
+#[derive(Debug, Clone)]
+pub struct RateLimiter {
+    /// Map from IP address to a list of request timestamps within the current window.
+    requests: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
+}
+
+impl RateLimiter {
+    /// Create a new, empty rate limiter.
+    pub fn new() -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Check whether the given IP address is allowed to make a request.
+    ///
+    /// Returns `true` if the request is allowed, `false` if the rate limit
+    /// has been exceeded. As a side-effect, expired timestamps are pruned and
+    /// (if allowed) the current timestamp is recorded.
+    pub fn check(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+        let mut map = self.requests.lock();
+
+        let timestamps = map.entry(ip).or_default();
+
+        // Remove timestamps outside the sliding window
+        timestamps.retain(|&t| now.duration_since(t) < window);
+
+        if timestamps.len() >= RATE_LIMIT_MAX_REQUESTS {
+            false
+        } else {
+            timestamps.push(now);
+            true
+        }
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Create the API router
 pub fn router(state: Arc<AppState>) -> Router {
+    let rate_limiter = RateLimiter::new();
+
     Router::new()
         .route("/health", get(health))
         .route("/pair", post(pair_device))
         .route("/devices", get(list_devices))
         .route("/devices/{node_id}", delete(revoke_device))
-        .with_state(state)
+        .with_state((state, rate_limiter))
 }
+
+/// Shared state type for all route handlers.
+type SharedState = (Arc<AppState>, RateLimiter);
 
 /// Health check endpoint
 async fn health() -> &'static str {
@@ -60,9 +147,20 @@ struct DeviceInfo {
 
 /// Pair a new device
 async fn pair_device(
-    State(state): State<Arc<AppState>>,
+    State((state, rate_limiter)): State<SharedState>,
+    ClientIp(ip): ClientIp,
     Json(req): Json<PairRequest>,
 ) -> Result<Json<PairResponse>, (StatusCode, String)> {
+
+    // Rate limit check
+    if !rate_limiter.check(ip) {
+        warn!(ip = %ip, "Pairing rate limit exceeded");
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many pairing attempts. Please try again later.".to_string(),
+        ));
+    }
+
     // Verify password
     if req.password != state.password {
         warn!(node_id = %req.node_id, "Pairing failed: invalid password");
@@ -118,7 +216,7 @@ async fn pair_device(
 
 /// List all registered devices
 async fn list_devices(
-    State(state): State<Arc<AppState>>,
+    State((state, _rate_limiter)): State<SharedState>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<DeviceInfo>>, (StatusCode, String)> {
     // Verify the requester is a registered device
@@ -167,7 +265,7 @@ struct RevokeRequest {
 
 /// Revoke a device
 async fn revoke_device(
-    State(state): State<Arc<AppState>>,
+    State((state, _rate_limiter)): State<SharedState>,
     Path(node_id_str): Path<String>,
     Json(req): Json<RevokeRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {

@@ -207,6 +207,7 @@ impl HumanSync {
             .secret_key(secret_key.clone())
             .alpns(vec![ALPN.to_vec()])
             .discovery_n0()
+            .discovery_local_network()
             .bind()
             .await
             .map_err(|e| Error::init(format!("failed to bind Iroh endpoint: {e}")))?;
