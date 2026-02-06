@@ -7,8 +7,13 @@ license.workspace = true
 repository.workspace = true
 description = "A local-first document editor powered by HumanSync"
 
+[lib]
+name = "humandocs"
+crate-type = ["staticlib", "cdylib", "lib"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+cc = "1"
 
 [dependencies]
 humansync = { path = "../../crates/humansync" }
