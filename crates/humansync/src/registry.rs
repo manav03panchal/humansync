@@ -8,8 +8,9 @@
 //! The registry is synchronized across all devices via the `_devices` Automerge document.
 //! Only devices in this registry are allowed to sync.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use automerge::{AutoCommit, ReadDoc, transaction::Transactable};
 use chrono::{DateTime, Utc};
@@ -336,6 +337,58 @@ impl DeviceRegistryStore {
         Ok(())
     }
 
+    /// Remove stale devices whose `last_seen` is older than `max_age`.
+    ///
+    /// Devices whose name matches any entry in `exempt_names` (case-insensitive)
+    /// are never pruned. This is used to protect the server, which may be
+    /// temporarily offline but should always be retried.
+    ///
+    /// Returns the list of pruned device infos.
+    pub fn prune_stale_devices(
+        &self,
+        max_age: Duration,
+        exempt_names: &[&str],
+    ) -> Result<Vec<DeviceInfo>> {
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::from_std(max_age)
+            .unwrap_or_else(|_| chrono::TimeDelta::MAX);
+
+        let devices = self.registry.list();
+        let mut pruned = Vec::new();
+
+        for device in devices {
+            // Skip exempt devices (e.g. the server)
+            let is_exempt = exempt_names
+                .iter()
+                .any(|name| device.name.eq_ignore_ascii_case(name));
+            if is_exempt {
+                debug!(
+                    node_id = %device.node_id,
+                    name = %device.name,
+                    "Skipping exempt device during prune"
+                );
+                continue;
+            }
+
+            if device.last_seen < cutoff {
+                info!(
+                    node_id = %device.node_id,
+                    name = %device.name,
+                    last_seen = %device.last_seen,
+                    "Pruning stale device"
+                );
+                self.remove(&device.node_id)?;
+                pruned.push(device);
+            }
+        }
+
+        if !pruned.is_empty() {
+            info!(count = pruned.len(), "Pruned stale devices from registry");
+        }
+
+        Ok(pruned)
+    }
+
     /// Check if a device is registered
     #[must_use]
     pub fn contains(&self, node_id: &NodeId) -> bool {
@@ -376,6 +429,9 @@ impl DeviceRegistryStore {
     ///
     /// This is called after sync cycles to pick up changes that were
     /// merged into the `_devices` doc during normal doc sync.
+    ///
+    /// Also resolves Automerge conflicts on the "devices" map that arise
+    /// when two devices independently create their registry during P2P pairing.
     pub fn reload_from_disk(&self) -> Result<()> {
         if !self.doc_path.exists() {
             return Ok(());
@@ -387,7 +443,7 @@ impl DeviceRegistryStore {
         match AutoCommit::load(&bytes) {
             Ok(loaded_doc) => {
                 let devices = Self::extract_devices_from_doc(&loaded_doc)?;
-                self.registry.load_from_doc(devices);
+                self.registry.load_from_doc(devices.clone());
                 *self.doc.write() = loaded_doc;
                 *self.dirty.write() = false;
                 debug!(
@@ -395,12 +451,60 @@ impl DeviceRegistryStore {
                     count = self.registry.len(),
                     "Reloaded device registry from disk"
                 );
+
+                // Resolve Automerge conflicts: if the "devices" key has
+                // multiple conflicting maps (from independent pairing on
+                // different devices), consolidate them into a single map.
+                if self.has_devices_conflict() {
+                    info!("Resolving conflicting devices maps after merge");
+                    self.resolve_devices_conflict(&devices)?;
+                    self.save()?;
+                }
             }
             Err(e) => {
                 warn!(error = %e, "Failed to load _devices document, skipping reload");
             }
         }
 
+        Ok(())
+    }
+
+    /// Check if the "devices" key has conflicting values (from independent merges).
+    fn has_devices_conflict(&self) -> bool {
+        let doc = self.doc.read();
+        match doc.get_all(automerge::ROOT, "devices") {
+            Ok(values) => values.len() > 1,
+            Err(_) => false,
+        }
+    }
+
+    /// Resolve conflicts on the "devices" key by rewriting a single canonical map
+    /// containing all devices from all conflicting maps.
+    fn resolve_devices_conflict(&self, devices: &[DeviceInfo]) -> Result<()> {
+        let mut doc = self.doc.write();
+
+        // Delete the conflicting "devices" key entirely
+        let _ = doc.delete(automerge::ROOT, "devices");
+
+        // Create a fresh single "devices" map with all merged devices
+        let devices_obj = doc
+            .put_object(automerge::ROOT, "devices", automerge::ObjType::Map)
+            .map_err(|e| Error::storage(format!("failed to create devices map: {e}")))?;
+
+        for device in devices {
+            let node_id_str = device.node_id.to_string();
+            let device_obj = doc
+                .put_object(&devices_obj, &node_id_str, automerge::ObjType::Map)
+                .map_err(|e| Error::storage(format!("failed to create device entry: {e}")))?;
+            doc.put(&device_obj, "name", device.name.clone())
+                .map_err(|e| Error::storage(format!("failed to set name: {e}")))?;
+            doc.put(&device_obj, "paired_at", device.paired_at.to_rfc3339())
+                .map_err(|e| Error::storage(format!("failed to set paired_at: {e}")))?;
+            doc.put(&device_obj, "last_seen", device.last_seen.to_rfc3339())
+                .map_err(|e| Error::storage(format!("failed to set last_seen: {e}")))?;
+        }
+
+        *self.dirty.write() = true;
         Ok(())
     }
 
@@ -497,52 +601,60 @@ impl DeviceRegistryStore {
     }
 
     /// Extract device info from an Automerge document
+    ///
+    /// Uses `get_all` to handle Automerge conflicts — when two devices
+    /// independently create a "devices" map (e.g., during P2P pairing),
+    /// the merge produces conflicting values at the same key. Using
+    /// `get_all` ensures we read devices from ALL conflicting maps.
     fn extract_devices_from_doc(doc: &AutoCommit) -> Result<Vec<DeviceInfo>> {
         let mut devices = Vec::new();
+        let mut seen_node_ids = HashSet::new();
 
-        // Get the devices map
-        let devices_obj = match doc.get(automerge::ROOT, "devices")
-            .map_err(|e| Error::storage(format!("failed to get devices map: {e}")))?
-        {
-            Some((_, obj_id)) => obj_id,
-            None => return Ok(devices), // No devices map yet
-        };
+        // Get ALL conflicting "devices" maps (handles independent document creation)
+        let all_values = doc.get_all(automerge::ROOT, "devices")
+            .map_err(|e| Error::storage(format!("failed to get devices maps: {e}")))?;
 
-        // Iterate over device entries
-        for key in doc.keys(&devices_obj) {
-            // Parse node_id from key
-            let node_id: NodeId = match key.parse() {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!(key = %key, error = %e, "Failed to parse node_id, skipping device");
-                    continue;
+        for (_, devices_obj) in all_values {
+            // Iterate over device entries in this map
+            for key in doc.keys(&devices_obj) {
+                if !seen_node_ids.insert(key.clone()) {
+                    continue; // Already seen this device from another conflicting map
                 }
-            };
 
-            // Get device object
-            let device_obj = match doc.get(&devices_obj, &key)
-                .map_err(|e| Error::storage(format!("failed to get device {key}: {e}")))?
-            {
-                Some((_, obj_id)) => obj_id,
-                None => continue,
-            };
+                // Parse node_id from key
+                let node_id: NodeId = match key.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!(key = %key, error = %e, "Failed to parse node_id, skipping device");
+                        continue;
+                    }
+                };
 
-            // Extract device properties
-            let name = Self::get_string_field(doc, &device_obj, "name")
-                .unwrap_or_else(|| "Unknown".to_string());
+                // Get device object
+                let device_obj = match doc.get(&devices_obj, &key)
+                    .map_err(|e| Error::storage(format!("failed to get device {key}: {e}")))?
+                {
+                    Some((_, obj_id)) => obj_id,
+                    None => continue,
+                };
 
-            let paired_at = Self::get_datetime_field(doc, &device_obj, "paired_at")
-                .unwrap_or_else(Utc::now);
+                // Extract device properties
+                let name = Self::get_string_field(doc, &device_obj, "name")
+                    .unwrap_or_else(|| "Unknown".to_string());
 
-            let last_seen = Self::get_datetime_field(doc, &device_obj, "last_seen")
-                .unwrap_or_else(Utc::now);
+                let paired_at = Self::get_datetime_field(doc, &device_obj, "paired_at")
+                    .unwrap_or_else(Utc::now);
 
-            devices.push(DeviceInfo {
-                node_id,
-                name,
-                paired_at,
-                last_seen,
-            });
+                let last_seen = Self::get_datetime_field(doc, &device_obj, "last_seen")
+                    .unwrap_or_else(Utc::now);
+
+                devices.push(DeviceInfo {
+                    node_id,
+                    name,
+                    paired_at,
+                    last_seen,
+                });
+            }
         }
 
         Ok(devices)
@@ -1019,5 +1131,105 @@ mod tests {
         assert!(store2.contains(&device_a));
         assert!(store2.contains(&device_b));
         assert!(store2.contains(&device_c));
+    }
+
+    // ========================================
+    // Stale device pruning tests
+    // ========================================
+
+    #[test]
+    fn test_prune_stale_devices_removes_old() {
+        let (_dir, store) = create_test_store();
+        let stale_id = test_node_id();
+        let fresh_id = test_node_id_2();
+
+        // Add a stale device with last_seen in the past
+        let mut stale_info = DeviceInfo::new(stale_id, "Stale Device");
+        stale_info.last_seen = Utc::now() - chrono::Duration::hours(2);
+        store.add(stale_info).unwrap();
+
+        // Add a fresh device
+        store.add(DeviceInfo::new(fresh_id, "Fresh Device")).unwrap();
+
+        assert_eq!(store.len(), 2);
+
+        // Prune devices not seen in the last hour
+        let pruned = store
+            .prune_stale_devices(Duration::from_secs(3600), &[])
+            .unwrap();
+
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].node_id, stale_id);
+        assert_eq!(store.len(), 1);
+        assert!(store.contains(&fresh_id));
+        assert!(!store.contains(&stale_id));
+    }
+
+    #[test]
+    fn test_prune_stale_devices_exempts_server() {
+        let (_dir, store) = create_test_store();
+        let server_id = test_node_id();
+        let stale_id = test_node_id_2();
+
+        // Add a stale server
+        let mut server_info = DeviceInfo::new(server_id, "Server");
+        server_info.last_seen = Utc::now() - chrono::Duration::hours(2);
+        store.add(server_info).unwrap();
+
+        // Add a stale non-server device
+        let mut stale_info = DeviceInfo::new(stale_id, "Old Laptop");
+        stale_info.last_seen = Utc::now() - chrono::Duration::hours(2);
+        store.add(stale_info).unwrap();
+
+        assert_eq!(store.len(), 2);
+
+        // Prune with "Server" exempt
+        let pruned = store
+            .prune_stale_devices(Duration::from_secs(3600), &["Server"])
+            .unwrap();
+
+        // Only the non-server device should be pruned
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].node_id, stale_id);
+        assert_eq!(store.len(), 1);
+        assert!(store.contains(&server_id));
+        assert!(!store.contains(&stale_id));
+    }
+
+    #[test]
+    fn test_prune_stale_devices_none_stale() {
+        let (_dir, store) = create_test_store();
+
+        // Add fresh devices
+        store.add(DeviceInfo::new(test_node_id(), "Device 1")).unwrap();
+        store.add(DeviceInfo::new(test_node_id_2(), "Device 2")).unwrap();
+
+        assert_eq!(store.len(), 2);
+
+        let pruned = store
+            .prune_stale_devices(Duration::from_secs(3600), &[])
+            .unwrap();
+
+        assert_eq!(pruned.len(), 0);
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn test_prune_stale_devices_exempt_case_insensitive() {
+        let (_dir, store) = create_test_store();
+        let server_id = test_node_id();
+
+        // Add a stale device named "server" (lowercase)
+        let mut info = DeviceInfo::new(server_id, "server");
+        info.last_seen = Utc::now() - chrono::Duration::hours(2);
+        store.add(info).unwrap();
+
+        let pruned = store
+            .prune_stale_devices(Duration::from_secs(3600), &["Server"])
+            .unwrap();
+
+        // Should not be pruned due to case-insensitive match
+        assert_eq!(pruned.len(), 0);
+        assert_eq!(store.len(), 1);
     }
 }

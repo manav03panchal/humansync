@@ -109,7 +109,7 @@ pub use config::Config;
 pub use doc::{CursorInfo, Document};
 pub use error::{Error, Result};
 pub use iroh::NodeId;
-pub use node::{HumanSync, SyncStatus};
+pub use node::{HumanSync, PairingInfo, PairingResult, SyncStatus};
 pub use registry::{DeviceInfo, DeviceRegistry, DeviceRegistryStore, DEVICES_DOC_NAME};
 
 // =============================================================================

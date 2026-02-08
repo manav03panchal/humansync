@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/humansync",
     "crates/humansync-server",
-    "humandocs/src-tauri",
+    # "humandocs/src-tauri",  # separate repo, uncomment when symlinked
 ]
 
 [workspace.package]

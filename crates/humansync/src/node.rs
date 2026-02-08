@@ -40,16 +40,43 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use iroh::{Endpoint, NodeAddr, NodeId, SecretKey};
 use parking_lot::RwLock;
-use tokio::sync::watch;
+use sha2::{Digest, Sha256};
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+
+/// Number of consecutive sync failures before a peer is automatically pruned.
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Tag byte for the pairing handshake protocol.
+const PAIR_REQUEST_TAG: u8 = 0xFE;
+
+/// Information returned when entering pairing mode, used to generate QR/link.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PairingInfo {
+    /// This device's node ID as a hex string.
+    pub node_id: String,
+    /// This device's human-readable name.
+    pub device_name: String,
+}
+
+/// Result of a successful pairing handshake.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PairingResult {
+    /// The remote device's node ID as a hex string.
+    pub node_id: String,
+    /// The remote device's human-readable name.
+    pub device_name: String,
+}
 
 use crate::config::Config;
 use crate::doc::Document;
@@ -181,6 +208,12 @@ pub struct HumanSync {
     registry: Arc<DeviceRegistryStore>,
     /// Sync status
     sync_status: Arc<RwLock<SyncStatus>>,
+    /// Whether the node is currently in pairing mode (accepting unknown peers).
+    pairing_mode: Arc<AtomicBool>,
+    /// One-shot sender to deliver the pairing result when a peer pairs successfully.
+    pairing_result_tx: Arc<RwLock<Option<oneshot::Sender<PairingResult>>>>,
+    /// SHA-256 hash of the PIN, set when entering pairing mode.
+    pairing_pin_hash: Arc<RwLock<Option<[u8; 32]>>>,
 }
 
 impl HumanSync {
@@ -236,6 +269,10 @@ impl HumanSync {
 
         let sync_status = Arc::new(RwLock::new(SyncStatus::default()));
 
+        let pairing_mode = Arc::new(AtomicBool::new(false));
+        let pairing_result_tx = Arc::new(RwLock::new(None));
+        let pairing_pin_hash: Arc<RwLock<Option<[u8; 32]>>> = Arc::new(RwLock::new(None));
+
         let node = Self {
             config: config.clone(),
             state: Arc::new(RwLock::new(NodeState::Running {
@@ -247,6 +284,9 @@ impl HumanSync {
             store: store.clone(),
             registry: registry.clone(),
             sync_status: sync_status.clone(),
+            pairing_mode: pairing_mode.clone(),
+            pairing_result_tx: pairing_result_tx.clone(),
+            pairing_pin_hash: pairing_pin_hash.clone(),
         };
 
         // Start accept loop for incoming P2P connections
@@ -254,6 +294,11 @@ impl HumanSync {
             endpoint.clone(),
             store.clone(),
             registry.clone(),
+            pairing_mode,
+            pairing_result_tx,
+            pairing_pin_hash,
+            config.device_name.clone(),
+            sync_status.clone(),
         );
 
         // Start background sync loop
@@ -386,6 +431,11 @@ impl HumanSync {
         self.store.list_docs(prefix)
     }
 
+    /// Rename a document (move its file and update the index).
+    pub async fn rename_doc(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.store.rename_doc(old_name, new_name).await
+    }
+
     /// Store a file as a blob
     ///
     /// Returns the content hash that can be used to reference the blob.
@@ -511,25 +561,271 @@ impl HumanSync {
     pub async fn sync_now(&self) -> Result<()> {
         let endpoint = self.endpoint().ok_or(Error::Shutdown)?;
 
+        // Manual sync uses a temporary failure counter (doesn't accumulate across calls)
+        let mut failure_counts = HashMap::new();
         Self::run_sync_cycle(
             &endpoint,
             &self.store,
             &self.registry,
             &self.sync_status,
+            &mut failure_counts,
         )
         .await;
 
         Ok(())
     }
 
+    /// Enter pairing mode so that an unknown peer can connect and pair.
+    ///
+    /// The returned `PairingInfo` contains this device's node ID and name for
+    /// generating a QR code or sharable link. The returned `Receiver` will
+    /// resolve once a remote device successfully completes the handshake.
+    pub fn enter_pairing_mode(
+        &self,
+        pin: &str,
+    ) -> Result<(PairingInfo, oneshot::Receiver<PairingResult>)> {
+        let node_id = self.node_id()?;
+        let pin_hash: [u8; 32] = Sha256::digest(pin.as_bytes()).into();
+
+        *self.pairing_pin_hash.write() = Some(pin_hash);
+
+        let (tx, rx) = oneshot::channel();
+        *self.pairing_result_tx.write() = Some(tx);
+
+        self.pairing_mode.store(true, Ordering::SeqCst);
+
+        info!("Entered pairing mode");
+
+        Ok((
+            PairingInfo {
+                node_id: node_id.to_string(),
+                device_name: self.config.device_name.clone(),
+            },
+            rx,
+        ))
+    }
+
+    /// Cancel pairing mode without completing a pairing.
+    pub fn cancel_pairing_mode(&self) {
+        self.pairing_mode.store(false, Ordering::SeqCst);
+        *self.pairing_pin_hash.write() = None;
+        // Drop the sender so the receiver gets a RecvError
+        *self.pairing_result_tx.write() = None;
+        info!("Cancelled pairing mode");
+    }
+
+    /// Initiate pairing with a remote device by its node ID.
+    ///
+    /// This is the "scanner" side of the pairing flow. It connects to the
+    /// remote device, sends the PIN hash and this device's name, and waits
+    /// for acceptance.
+    pub async fn pair_with_node_id(
+        &self,
+        remote_node_id: &NodeId,
+        remote_name_hint: &str,
+        pin: &str,
+    ) -> Result<PairingResult> {
+        let endpoint = self.endpoint().ok_or(Error::Shutdown)?;
+        let pin_hash: [u8; 32] = Sha256::digest(pin.as_bytes()).into();
+        let my_name = self.config.device_name.as_bytes();
+
+        // Add the remote to our registry first
+        self.registry
+            .add(crate::registry::DeviceInfo::new(*remote_node_id, remote_name_hint))
+            .map_err(|e| Error::pairing(format!("failed to add remote to registry: {e}")))?;
+        self.registry
+            .save()
+            .map_err(|e| Error::pairing(format!("failed to save registry: {e}")))?;
+
+        // Connect to remote with timeout
+        let conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            endpoint.connect(NodeAddr::new(*remote_node_id), ALPN),
+        )
+        .await
+        .map_err(|_| Error::pairing("connection to remote timed out"))?
+        .map_err(|e| Error::pairing(format!("failed to connect to remote: {e}")))?;
+
+        // Open a bidi stream
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| Error::pairing(format!("failed to open stream: {e}")))?;
+
+        // Send: [0xFE][pin_hash: 32][name_len: u16 BE][name_bytes]
+        let name_len = (my_name.len() as u16).to_be_bytes();
+        let mut payload = Vec::with_capacity(1 + 32 + 2 + my_name.len());
+        payload.push(PAIR_REQUEST_TAG);
+        payload.extend_from_slice(&pin_hash);
+        payload.extend_from_slice(&name_len);
+        payload.extend_from_slice(my_name);
+
+        send.write_all(&payload)
+            .await
+            .map_err(|e| Error::pairing(format!("failed to send pairing request: {e}")))?;
+        send.finish()
+            .map_err(|e| Error::pairing(format!("failed to finish send: {e}")))?;
+
+        // Read response: first byte is accept/reject
+        let mut response_tag = [0u8; 1];
+        recv.read_exact(&mut response_tag)
+            .await
+            .map_err(|e| Error::pairing(format!("failed to read pairing response: {e}")))?;
+
+        if response_tag[0] == 0x00 {
+            // Rejected -- remove the remote we just added
+            let _ = self.registry.remove(remote_node_id);
+            let _ = self.registry.save();
+            return Err(Error::pairing("PIN rejected by remote device"));
+        }
+
+        // Accepted: read [name_len: u16 BE][name_bytes]
+        let mut peer_name_len_buf = [0u8; 2];
+        recv.read_exact(&mut peer_name_len_buf)
+            .await
+            .map_err(|e| Error::pairing(format!("failed to read peer name length: {e}")))?;
+        let peer_name_len = u16::from_be_bytes(peer_name_len_buf) as usize;
+        if peer_name_len == 0 || peer_name_len > 256 {
+            return Err(Error::pairing(format!("invalid peer name length: {peer_name_len}")));
+        }
+
+        let mut peer_name_buf = vec![0u8; peer_name_len];
+        recv.read_exact(&mut peer_name_buf)
+            .await
+            .map_err(|e| Error::pairing(format!("failed to read peer name: {e}")))?;
+
+        let peer_name = String::from_utf8(peer_name_buf)
+            .unwrap_or_else(|_| remote_name_hint.to_string());
+
+        // Update the registry entry with the confirmed name from the peer
+        let _ = self.registry.remove(remote_node_id);
+        self.registry
+            .add(crate::registry::DeviceInfo::new(*remote_node_id, &peer_name))
+            .map_err(|e| Error::pairing(format!("failed to update registry: {e}")))?;
+        self.registry
+            .save()
+            .map_err(|e| Error::pairing(format!("failed to save registry: {e}")))?;
+
+        // Trigger immediate sync
+        let _ = self.sync_now().await;
+
+        info!(remote = %remote_node_id, name = %peer_name, "Pairing completed (scanner side)");
+
+        Ok(PairingResult {
+            node_id: remote_node_id.to_string(),
+            device_name: peer_name,
+        })
+    }
+
+    /// Handle the pairing handshake on the accepting side.
+    ///
+    /// Reads the pairing request from the incoming connection, verifies the PIN,
+    /// and if accepted adds the remote to the registry.
+    async fn handle_pairing_handshake(
+        conn: iroh::endpoint::Connection,
+        remote_node_id: NodeId,
+        registry: &Arc<DeviceRegistryStore>,
+        pairing_pin_hash: &Arc<RwLock<Option<[u8; 32]>>>,
+        device_name: &str,
+    ) -> Result<PairingResult> {
+        let (mut send, mut recv) = conn
+            .accept_bi()
+            .await
+            .map_err(|e| Error::pairing(format!("failed to accept stream: {e}")))?;
+
+        // Read tag byte
+        let mut tag = [0u8; 1];
+        recv.read_exact(&mut tag)
+            .await
+            .map_err(|e| Error::pairing(format!("failed to read tag: {e}")))?;
+
+        if tag[0] != PAIR_REQUEST_TAG {
+            return Err(Error::pairing(format!(
+                "unexpected tag byte: {:#x}",
+                tag[0]
+            )));
+        }
+
+        // Read 32 bytes of PIN hash
+        let mut received_hash = [0u8; 32];
+        recv.read_exact(&mut received_hash)
+            .await
+            .map_err(|e| Error::pairing(format!("failed to read PIN hash: {e}")))?;
+
+        // Verify PIN hash
+        let expected_hash = pairing_pin_hash.read().ok_or_else(|| {
+            Error::pairing("no PIN hash set (pairing mode was cancelled)")
+        })?;
+
+        if received_hash != expected_hash {
+            // Reject: send [0x00]
+            let _ = send.write_all(&[0x00]).await;
+            let _ = send.finish();
+            return Err(Error::pairing("PIN mismatch"));
+        }
+
+        // Read name_len (u16 BE) and name_bytes
+        let mut name_len_buf = [0u8; 2];
+        recv.read_exact(&mut name_len_buf)
+            .await
+            .map_err(|e| Error::pairing(format!("failed to read name length: {e}")))?;
+        let name_len = u16::from_be_bytes(name_len_buf) as usize;
+        if name_len == 0 || name_len > 256 {
+            return Err(Error::pairing(format!("invalid device name length: {name_len}")));
+        }
+
+        let mut name_buf = vec![0u8; name_len];
+        recv.read_exact(&mut name_buf)
+            .await
+            .map_err(|e| Error::pairing(format!("failed to read name: {e}")))?;
+
+        let remote_name =
+            String::from_utf8(name_buf).unwrap_or_else(|_| "Device".to_string());
+
+        // Accept: add remote to registry
+        registry
+            .add(crate::registry::DeviceInfo::new(remote_node_id, &remote_name))
+            .map_err(|e| Error::pairing(format!("failed to add peer to registry: {e}")))?;
+        registry
+            .save()
+            .map_err(|e| Error::pairing(format!("failed to save registry: {e}")))?;
+
+        // Send acceptance: [0x01][name_len: u16 BE][name_bytes]
+        let our_name = device_name.as_bytes();
+        let our_name_len = (our_name.len() as u16).to_be_bytes();
+        let mut response = Vec::with_capacity(1 + 2 + our_name.len());
+        response.push(0x01);
+        response.extend_from_slice(&our_name_len);
+        response.extend_from_slice(our_name);
+
+        send.write_all(&response)
+            .await
+            .map_err(|e| Error::pairing(format!("failed to send acceptance: {e}")))?;
+        send.finish()
+            .map_err(|e| Error::pairing(format!("failed to finish stream: {e}")))?;
+
+        info!(remote = %remote_node_id, name = %remote_name, "Pairing completed (acceptor side)");
+
+        Ok(PairingResult {
+            node_id: remote_node_id.to_string(),
+            device_name: remote_name,
+        })
+    }
+
     /// Start an accept loop for incoming P2P connections.
     ///
     /// This allows other devices to connect to us directly (e.g., via mDNS on
-    /// the same LAN). Incoming connections are gated against the device registry.
+    /// the same LAN). Incoming connections are gated against the device registry,
+    /// with a special branch for pairing mode.
     fn start_accept_loop(
         endpoint: Endpoint,
         store: Arc<Store>,
         registry: Arc<DeviceRegistryStore>,
+        pairing_mode: Arc<AtomicBool>,
+        pairing_result_tx: Arc<RwLock<Option<oneshot::Sender<PairingResult>>>>,
+        pairing_pin_hash: Arc<RwLock<Option<[u8; 32]>>>,
+        device_name: String,
+        sync_status: Arc<RwLock<SyncStatus>>,
     ) {
         tokio::spawn(async move {
             info!("Client accept loop started");
@@ -559,19 +855,71 @@ impl HumanSync {
                 };
 
                 // Gate against device registry
-                if !registry.is_authorized(&remote_node_id) {
+                if registry.is_authorized(&remote_node_id) {
+                    info!(remote = %remote_node_id, "Accepted P2P connection");
+
+                    let store = store.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_incoming_connection(conn, store).await {
+                            debug!(remote = %remote_node_id, error = %e, "Incoming connection handler finished");
+                        }
+                    });
+                } else if pairing_mode.load(Ordering::SeqCst) {
+                    // Unknown peer while in pairing mode -- handle pairing handshake.
+                    // We keep pairing_mode=true until the handshake succeeds so that
+                    // a failed attempt (wrong PIN, timeout, etc.) doesn't lock out retries.
+                    info!(remote = %remote_node_id, "Accepting unknown connection for pairing");
+                    let registry = registry.clone();
+                    let pairing_result_tx = pairing_result_tx.clone();
+                    let pairing_pin_hash = pairing_pin_hash.clone();
+                    let pairing_mode = pairing_mode.clone();
+                    let device_name = device_name.clone();
+                    let endpoint = endpoint.clone();
+                    let store = store.clone();
+                    let sync_status = sync_status.clone();
+                    tokio::spawn(async move {
+                        match Self::handle_pairing_handshake(
+                            conn,
+                            remote_node_id,
+                            &registry,
+                            &pairing_pin_hash,
+                            &device_name,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                // Handshake succeeded — now disable pairing mode
+                                pairing_mode.store(false, Ordering::SeqCst);
+
+                                // Send the result (scope the guard so it's dropped before the await)
+                                {
+                                    let mut guard = pairing_result_tx.write();
+                                    if let Some(tx) = guard.take() {
+                                        let _ = tx.send(result);
+                                    }
+                                }
+
+                                // Trigger immediate sync so the new peer's docs are exchanged
+                                let mut failure_counts = HashMap::new();
+                                Self::run_sync_cycle(
+                                    &endpoint,
+                                    &store,
+                                    &registry,
+                                    &sync_status,
+                                    &mut failure_counts,
+                                )
+                                .await;
+                                info!("Post-pairing sync completed (acceptor side)");
+                            }
+                            Err(e) => {
+                                // Pairing failed — pairing_mode stays true so user can retry
+                                warn!(error = %e, "Pairing handshake failed");
+                            }
+                        }
+                    });
+                } else {
                     debug!(remote = %remote_node_id, "Rejected connection from unknown device");
-                    continue;
                 }
-
-                info!(remote = %remote_node_id, "Accepted P2P connection");
-
-                let store = store.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = Self::handle_incoming_connection(conn, store).await {
-                        debug!(remote = %remote_node_id, error = %e, "Incoming connection handler finished");
-                    }
-                });
             }
             info!("Client accept loop stopped");
         });
@@ -695,6 +1043,8 @@ impl HumanSync {
                 "Background sync loop started"
             );
 
+            let mut failure_counts: HashMap<NodeId, u32> = HashMap::new();
+
             loop {
                 // Use tokio::select! for cancellation
                 tokio::select! {
@@ -708,7 +1058,7 @@ impl HumanSync {
                     // Sleep for the sync interval
                     _ = tokio::time::sleep(sync_interval) => {
                         // Run a sync cycle
-                        Self::run_sync_cycle(&endpoint, &store, &registry, &sync_status).await;
+                        Self::run_sync_cycle(&endpoint, &store, &registry, &sync_status, &mut failure_counts).await;
                     }
                 }
             }
@@ -717,14 +1067,112 @@ impl HumanSync {
         })
     }
 
+    /// Migrate vault documents after syncing `_vaults.automerge`.
+    ///
+    /// Reads the shared vault registry doc, compares vault IDs by name,
+    /// picks the canonical ID (earliest `created_at`), and renames document
+    /// prefixes from the losing ID to the winning ID.
+    ///
+    /// Returns the number of documents migrated.
+    pub async fn migrate_vault_docs(&self) -> Result<usize> {
+        let vaults_doc_name = "_vaults.automerge";
+        let doc = match self.store.open_doc(vaults_doc_name).await {
+            Ok(d) => d,
+            Err(_) => return Ok(0), // No shared vault doc yet
+        };
+
+        let keys = doc.keys()?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        // Parse shared vault entries: vault_id -> (name, created_at)
+        #[derive(serde::Deserialize)]
+        struct SharedVault {
+            name: String,
+            created_at: String,
+        }
+
+        let mut shared_vaults: Vec<(String, String, String)> = Vec::new(); // (id, name, created_at)
+        for key in &keys {
+            if key.starts_with('_') {
+                continue;
+            }
+            if let Ok(Some(json_str)) = doc.get::<String>(key) {
+                if let Ok(sv) = serde_json::from_str::<SharedVault>(&json_str) {
+                    shared_vaults.push((key.clone(), sv.name, sv.created_at));
+                }
+            }
+        }
+
+        if shared_vaults.is_empty() {
+            return Ok(0);
+        }
+
+        // Group vaults by name to find conflicts
+        let mut by_name: HashMap<String, Vec<(String, String)>> = HashMap::new(); // name -> [(id, created_at)]
+        for (id, name, created_at) in &shared_vaults {
+            by_name
+                .entry(name.clone())
+                .or_default()
+                .push((id.clone(), created_at.clone()));
+        }
+
+        let mut total_migrated = 0;
+
+        for (_name, mut entries) in by_name {
+            if entries.len() < 2 {
+                continue;
+            }
+
+            // Sort by created_at -- earliest wins
+            entries.sort_by(|a, b| a.1.cmp(&b.1));
+            let canonical_id = &entries[0].0;
+
+            // Migrate docs from all non-canonical IDs to the canonical one
+            for (loser_id, _) in &entries[1..] {
+                if loser_id == canonical_id {
+                    continue;
+                }
+                let old_prefix = format!("humandocs/vault-{loser_id}/doc-");
+                if let Ok(old_docs) = self.store.list_docs(&old_prefix) {
+                    let new_prefix = format!("humandocs/vault-{canonical_id}/doc-");
+                    for old_name in old_docs {
+                        let new_name = old_name.replace(&old_prefix, &new_prefix);
+                        info!(
+                            old_name = %old_name,
+                            new_name = %new_name,
+                            "migrate_vault_docs: renaming document to canonical vault prefix"
+                        );
+                        if let Err(e) = self.store.rename_doc(&old_name, &new_name).await {
+                            warn!(error = %e, old_name = %old_name, "Failed to migrate document");
+                        } else {
+                            total_migrated += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if total_migrated > 0 {
+            info!(total_migrated, "Vault document migration completed");
+        }
+
+        Ok(total_migrated)
+    }
+
     /// Run a single sync cycle
     ///
     /// This syncs with all known peers in the device registry.
+    /// `failure_counts` tracks consecutive connection failures per peer across cycles.
+    /// After `MAX_CONSECUTIVE_FAILURES` consecutive failures, a peer is automatically
+    /// removed from the registry (unless it is the server).
     async fn run_sync_cycle(
         endpoint: &Endpoint,
         store: &Arc<Store>,
         registry: &Arc<DeviceRegistryStore>,
         sync_status: &Arc<RwLock<SyncStatus>>,
+        failure_counts: &mut HashMap<NodeId, u32>,
     ) {
         debug!("Starting sync cycle");
 
@@ -737,6 +1185,7 @@ impl HumanSync {
         let my_node_id = endpoint.node_id();
         let mut peers_connected = 0;
         let mut docs_synced = 0;
+        let mut total_docs = 0usize;
 
         for device in &devices {
             // Skip ourselves
@@ -752,10 +1201,13 @@ impl HumanSync {
 
             // Try to sync with this peer
             match Self::sync_with_peer(endpoint, store, &device.node_id).await {
-                Ok(synced_count) => {
+                Ok((synced_count, doc_count)) => {
                     peers_connected += 1;
                     docs_synced += synced_count;
+                    total_docs = total_docs.max(doc_count);
                     let _ = registry.touch(&device.node_id);
+                    // Reset failure counter on success
+                    failure_counts.remove(&device.node_id);
                     debug!(
                         peer = %device.node_id,
                         docs_synced = synced_count,
@@ -763,11 +1215,31 @@ impl HumanSync {
                     );
                 }
                 Err(e) => {
+                    let count = failure_counts.entry(device.node_id).or_insert(0);
+                    *count += 1;
                     warn!(
                         peer = %device.node_id,
+                        consecutive_failures = *count,
                         error = %e,
                         "Failed to sync with peer"
                     );
+
+                    // Prune peer after too many consecutive failures,
+                    // but never prune the server (name == "Server")
+                    if *count >= MAX_CONSECUTIVE_FAILURES
+                        && !device.name.eq_ignore_ascii_case("server")
+                    {
+                        info!(
+                            peer = %device.node_id,
+                            name = %device.name,
+                            failures = *count,
+                            "Removing peer after repeated connection failures"
+                        );
+                        if let Err(e) = registry.remove(&device.node_id) {
+                            warn!(error = %e, "Failed to remove stale peer from registry");
+                        }
+                        failure_counts.remove(&device.node_id);
+                    }
                 }
             }
         }
@@ -776,14 +1248,97 @@ impl HumanSync {
         {
             let mut status = sync_status.write();
             status.peers_connected = peers_connected;
-            status.docs_pending = 0; // Reset after sync
-            status.last_sync = Some(Utc::now());
+            if peers_connected > 0 {
+                // Only mark docs_pending = 0 when all docs synced successfully
+                if total_docs > 0 && docs_synced >= total_docs {
+                    status.docs_pending = 0;
+                } else if total_docs > docs_synced {
+                    status.docs_pending = total_docs - docs_synced;
+                }
+                status.last_sync = Some(Utc::now());
+            }
         }
 
         // After syncing, reload the device registry from the _devices doc on disk.
         // This picks up newly paired devices that were synced from the server.
         if let Err(e) = registry.reload_from_disk() {
             warn!(error = %e, "Failed to reload device registry after sync");
+        }
+
+        // Run vault document migration after sync to move docs under canonical vault IDs.
+        // This is a no-op if _vaults.automerge doesn't exist or has no conflicts.
+        {
+            // Build a temporary HumanSync-like context to call migrate_vault_docs.
+            // We only need store access, which we already have.
+            let vaults_doc_name = "_vaults.automerge";
+            if let Ok(doc) = store.open_doc(vaults_doc_name).await {
+                if let Ok(keys) = doc.keys() {
+                    if !keys.is_empty() {
+                        #[derive(serde::Deserialize)]
+                        struct SharedVault {
+                            name: String,
+                            created_at: String,
+                        }
+
+                        let mut shared_vaults: Vec<(String, String, String)> = Vec::new();
+                        for key in &keys {
+                            if key.starts_with('_') {
+                                continue;
+                            }
+                            if let Ok(Some(json_str)) = doc.get::<String>(key) {
+                                if let Ok(sv) = serde_json::from_str::<SharedVault>(&json_str) {
+                                    shared_vaults.push((key.clone(), sv.name, sv.created_at));
+                                }
+                            }
+                        }
+
+                        // Group by name and migrate
+                        let mut by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                        for (id, name, created_at) in &shared_vaults {
+                            by_name
+                                .entry(name.clone())
+                                .or_default()
+                                .push((id.clone(), created_at.clone()));
+                        }
+
+                        for (_name, mut entries) in by_name {
+                            if entries.len() < 2 {
+                                continue;
+                            }
+                            entries.sort_by(|a, b| a.1.cmp(&b.1));
+                            let canonical_id = entries[0].0.clone();
+                            for (loser_id, _) in &entries[1..] {
+                                if *loser_id == canonical_id {
+                                    continue;
+                                }
+                                let old_prefix = format!("humandocs/vault-{loser_id}/doc-");
+                                if let Ok(old_docs) = store.list_docs(&old_prefix) {
+                                    let new_prefix =
+                                        format!("humandocs/vault-{canonical_id}/doc-");
+                                    for old_name in old_docs {
+                                        let new_name =
+                                            old_name.replace(&old_prefix, &new_prefix);
+                                        info!(
+                                            old_name = %old_name,
+                                            new_name = %new_name,
+                                            "sync loop: migrating document to canonical vault prefix"
+                                        );
+                                        if let Err(e) =
+                                            store.rename_doc(&old_name, &new_name).await
+                                        {
+                                            warn!(
+                                                error = %e,
+                                                old_name = %old_name,
+                                                "Failed to migrate document in sync loop"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         debug!(
@@ -795,18 +1350,20 @@ impl HumanSync {
 
     /// Sync documents with a specific peer
     ///
-    /// Returns the number of documents synced.
+    /// Returns `(synced_count, total_doc_count)` -- the number of documents
+    /// successfully synced and the total number of documents attempted.
     ///
     /// The sync process:
-    /// 1. Request the peer's document list (doc discovery)
+    /// 1. Request the peer's document list (doc discovery) with one retry
     /// 2. Compute the union of local and remote doc names
-    /// 3. Sync each document in the union
-    /// 4. Sync blobs referenced by all documents
+    /// 3. Sort so system docs (`_`-prefixed) sync first
+    /// 4. Sync each document in the union
+    /// 5. Sync blobs referenced by all documents
     async fn sync_with_peer(
         endpoint: &Endpoint,
         store: &Arc<Store>,
         peer_node_id: &NodeId,
-    ) -> Result<usize> {
+    ) -> Result<(usize, usize)> {
         debug!(peer = %peer_node_id, "Connecting to peer for sync");
 
         let node_addr = NodeAddr::new(*peer_node_id);
@@ -822,15 +1379,27 @@ impl HumanSync {
 
         debug!(peer = %peer_node_id, "Connected to peer");
 
-        // Step 1: Request remote doc list for discovery
+        // Step 1: Request remote doc list for discovery (with one retry)
+        let mut doc_list_failed = false;
         let remote_docs = match request_doc_list(&conn).await {
             Ok(docs) => {
                 debug!(peer = %peer_node_id, count = docs.len(), "Received remote doc list");
                 docs
             }
-            Err(e) => {
-                warn!(peer = %peer_node_id, error = %e, "Failed to get remote doc list, syncing local only");
-                Vec::new()
+            Err(first_err) => {
+                warn!(peer = %peer_node_id, error = %first_err, "Failed to get remote doc list, retrying in 1s");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                match request_doc_list(&conn).await {
+                    Ok(docs) => {
+                        debug!(peer = %peer_node_id, count = docs.len(), "Received remote doc list on retry");
+                        docs
+                    }
+                    Err(retry_err) => {
+                        warn!(peer = %peer_node_id, error = %retry_err, "Doc list retry also failed, syncing local only");
+                        doc_list_failed = true;
+                        Vec::new()
+                    }
+                }
             }
         };
 
@@ -844,7 +1413,19 @@ impl HumanSync {
             }
         }
 
-        // Step 3: Sync each document
+        // Step 3: Sort so system docs (_-prefixed) sync first
+        all_doc_names.sort_by(|a, b| {
+            let a_system = a.starts_with('_');
+            let b_system = b.starts_with('_');
+            match (a_system, b_system) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.cmp(b),
+            }
+        });
+
+        // Step 4: Sync each document
+        let total_doc_count = all_doc_names.len();
         let mut synced_count = 0;
 
         for doc_name in &all_doc_names {
@@ -873,7 +1454,7 @@ impl HumanSync {
             }
         }
 
-        // Step 4: Sync blobs referenced by all documents (including newly discovered ones)
+        // Step 5: Sync blobs referenced by all documents (including newly discovered ones)
         let mut all_blob_hashes = Vec::new();
         for doc_name in &all_doc_names {
             if let Ok(doc) = store.open_doc(doc_name).await {
@@ -908,7 +1489,13 @@ impl HumanSync {
             }
         }
 
-        Ok(synced_count)
+        // If doc list discovery failed, don't report full sync success even
+        // if all local docs synced -- we may have missed remote-only docs.
+        if doc_list_failed {
+            Ok((synced_count, total_doc_count + 1))
+        } else {
+            Ok((synced_count, total_doc_count))
+        }
     }
 }
 

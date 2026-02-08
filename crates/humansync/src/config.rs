@@ -90,6 +90,12 @@ pub struct Config {
     /// and evict least-recently-used entries when the total cache size exceeds
     /// this limit. Set to `None` (the default) for unlimited cache size.
     pub max_blob_cache_bytes: Option<u64>,
+
+    /// Human-readable name for this device.
+    ///
+    /// Used during QR/link pairing to identify the device to peers.
+    /// Default is `"Device"`.
+    pub device_name: String,
 }
 
 impl Config {
@@ -103,6 +109,7 @@ impl Config {
             iroh_port: DEFAULT_IROH_PORT,
             relay_url: None,
             max_blob_cache_bytes: None,
+            device_name: "Device".to_string(),
         }
     }
 
@@ -131,6 +138,13 @@ impl Config {
     #[must_use]
     pub fn with_relay_url(mut self, url: impl Into<String>) -> Self {
         self.relay_url = Some(url.into());
+        self
+    }
+
+    /// Set the device name
+    #[must_use]
+    pub fn with_device_name(mut self, name: impl Into<String>) -> Self {
+        self.device_name = name.into();
         self
     }
 

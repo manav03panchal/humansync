@@ -263,6 +263,36 @@ impl Store {
         Ok(docs)
     }
 
+    /// Rename a document on disk and update the index.
+    ///
+    /// Moves the `.automerge` file from the old name's path to the new name's
+    /// path, creating parent directories as needed.  If the old doc does not
+    /// exist on disk the call is a no-op.
+    pub async fn rename_doc(&self, old_name: &str, new_name: &str) -> Result<()> {
+        let old_path = self.doc_path(old_name);
+        if !old_path.exists() {
+            debug!(old_name, "rename_doc: source does not exist, skipping");
+            return Ok(());
+        }
+
+        let new_path = self.doc_path(new_name);
+        if let Some(parent) = new_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Error::storage(format!("failed to create dir for rename: {e}")))?;
+        }
+
+        tokio::fs::rename(&old_path, &new_path)
+            .await
+            .map_err(|e| Error::storage(format!("failed to rename doc: {e}")))?;
+
+        // Update the index: remove old entry, copy metadata to new entry
+        self.rename_index_entry(old_name, new_name).await?;
+
+        info!(old_name, new_name, "Document renamed");
+        Ok(())
+    }
+
     /// Delete a document from disk and update the index
     ///
     /// Returns `Ok(())` if the document was deleted or didn't exist.
@@ -492,6 +522,74 @@ impl Store {
 
                 debug!(doc_name, "Index entry removed");
             }
+        }
+
+        Ok(())
+    }
+
+    /// Rename an index entry: copy metadata from old name to new name, delete old.
+    async fn rename_index_entry(&self, old_name: &str, new_name: &str) -> Result<()> {
+        debug!(old_name, new_name, "Renaming index entry");
+
+        let _guard = self.index_lock.lock().await;
+        let path = self.index_path();
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let temp_path = path.with_extension("automerge.tmp");
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| Error::storage(format!("failed to read index: {e}")))?;
+
+        let mut doc = match AutoCommit::load(&bytes) {
+            Ok(doc) => doc,
+            Err(e) => {
+                warn!("Index file corrupted during rename, recreating: {e}");
+                let _ = tokio::fs::remove_file(&path).await;
+                return Ok(());
+            }
+        };
+
+        if let Ok(Some((automerge::Value::Object(automerge::ObjType::Map), docs_obj))) =
+            doc.get(automerge::ROOT, "docs")
+        {
+            // Read metadata from old entry
+            let modified_str = if let Ok(Some((automerge::Value::Object(automerge::ObjType::Map), old_entry))) =
+                doc.get(&docs_obj, old_name)
+            {
+                doc.get(&old_entry, "modified")
+                    .ok()
+                    .flatten()
+                    .and_then(|(v, _)| match v {
+                        automerge::Value::Scalar(s) => Some(s.to_string()),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+
+            // Delete old entry
+            if doc.get(&docs_obj, old_name).ok().flatten().is_some() {
+                let _ = doc.delete(&docs_obj, old_name);
+            }
+
+            // Create new entry with same metadata
+            if let Some(modified) = modified_str {
+                let new_entry = doc
+                    .put_object(&docs_obj, new_name, automerge::ObjType::Map)
+                    .map_err(|e| Error::storage(format!("failed to create index entry: {e}")))?;
+                let _ = doc.put(&new_entry, "modified", modified);
+            }
+
+            // Save atomically
+            let bytes = doc.save();
+            tokio::fs::write(&temp_path, &bytes)
+                .await
+                .map_err(|e| Error::storage(format!("failed to write index temp file: {e}")))?;
+            tokio::fs::rename(&temp_path, &path)
+                .await
+                .map_err(|e| Error::storage(format!("failed to rename index temp file: {e}")))?;
         }
 
         Ok(())
