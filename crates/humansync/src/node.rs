@@ -1108,10 +1108,10 @@ impl HumanSync {
             if key.starts_with('_') {
                 continue;
             }
-            if let Ok(Some(json_str)) = doc.get::<String>(key) {
-                if let Ok(sv) = serde_json::from_str::<SharedVault>(&json_str) {
-                    shared_vaults.push((key.clone(), sv.name, sv.created_at));
-                }
+            // Read as SharedVault directly — doc.get::<String>() fails because
+            // automerge_value_to_json auto-parses JSON strings into objects.
+            if let Ok(Some(sv)) = doc.get::<SharedVault>(key) {
+                shared_vaults.push((key.clone(), sv.name, sv.created_at));
             }
         }
 
@@ -1291,10 +1291,11 @@ impl HumanSync {
                             if key.starts_with('_') {
                                 continue;
                             }
-                            if let Ok(Some(json_str)) = doc.get::<String>(key) {
-                                if let Ok(sv) = serde_json::from_str::<SharedVault>(&json_str) {
-                                    shared_vaults.push((key.clone(), sv.name, sv.created_at));
-                                }
+                            // Read as SharedVault directly — doc.get::<String>() fails
+                            // because automerge_value_to_json auto-parses JSON strings
+                            // into objects, so we must deserialize as the target struct.
+                            if let Ok(Some(sv)) = doc.get::<SharedVault>(key) {
+                                shared_vaults.push((key.clone(), sv.name, sv.created_at));
                             }
                         }
 
