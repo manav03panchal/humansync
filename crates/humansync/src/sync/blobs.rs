@@ -405,7 +405,22 @@ pub fn validate_blob(data: &[u8], expected_hash: &str) -> bool {
 ///
 /// Looks for fields that contain blob hashes (stored as strings).
 /// Blob hashes are identified by their format (64-char hex string).
+///
+/// This function first tries to load the bytes as an Automerge document
+/// and read blob hashes from string values (especially the "attachments"
+/// JSON field). This is necessary because Automerge uses columnar
+/// compression, so raw byte scanning won't find hashes in the binary.
+///
+/// Falls back to JSON parsing and raw byte scanning for non-Automerge data.
 pub fn extract_blob_refs(doc_bytes: &[u8]) -> Vec<String> {
+    // Try to load as an Automerge document and extract hashes from values
+    if let Ok(doc) = automerge::AutoCommit::load(doc_bytes) {
+        let hashes = extract_hashes_from_automerge(&doc);
+        if !hashes.is_empty() {
+            return hashes;
+        }
+    }
+
     // Try to parse as JSON and look for hash-like strings
     if let Ok(json_str) = std::str::from_utf8(doc_bytes) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
@@ -415,6 +430,58 @@ pub fn extract_blob_refs(doc_bytes: &[u8]) -> Vec<String> {
 
     // Fall back to regex-like search for 64-char hex strings
     extract_hashes_from_bytes(doc_bytes)
+}
+
+/// Extract blob hashes from an Automerge document by reading all string values
+/// at the root level and parsing any JSON that contains hash-like strings.
+fn extract_hashes_from_automerge(doc: &automerge::AutoCommit) -> Vec<String> {
+    use automerge::ReadDoc;
+
+    let mut hashes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for key in doc.keys(automerge::ROOT) {
+        match doc.get(automerge::ROOT, key.as_str()) {
+            Ok(Some((automerge::Value::Scalar(s), _))) => {
+                if let automerge::ScalarValue::Str(val) = s.as_ref() {
+                    let val_str = val.to_string();
+                    // Check if the value itself is a hash
+                    if is_valid_hash(&val_str) {
+                        if seen.insert(val_str.clone()) {
+                            hashes.push(val_str);
+                        }
+                        continue;
+                    }
+                    // Try to parse as JSON and extract hashes from it
+                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
+                        let json_hashes = extract_hashes_from_json(&json_val);
+                        for h in json_hashes {
+                            if seen.insert(h.clone()) {
+                                hashes.push(h);
+                            }
+                        }
+                    }
+                }
+            }
+            // Also check Text objects (content field may contain blob:HASH references)
+            Ok(Some((automerge::Value::Object(automerge::ObjType::Text), obj_id))) => {
+                if let Ok(text) = doc.text(&obj_id) {
+                    // Look for blob:HASH patterns in text content
+                    for part in text.split("blob:") {
+                        if part.len() >= 64 {
+                            let candidate = &part[..64];
+                            if is_valid_hash(candidate) && seen.insert(candidate.to_string()) {
+                                hashes.push(candidate.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    hashes
 }
 
 /// Extract hash-like strings from JSON value
@@ -1232,5 +1299,136 @@ mod tests {
 
         let evicted = store.evict_lru().await.unwrap();
         assert_eq!(evicted, 0); // No eviction when no limit set
+    }
+
+    // ==========================================
+    // Tests for extract_blob_refs with Automerge
+    // ==========================================
+
+    /// Test that extract_blob_refs finds hashes in Automerge binary data
+    /// This is the critical test: attachments are stored as a JSON string
+    /// in an Automerge doc field called "attachments". The Automerge binary
+    /// format uses columnar compression, so raw byte scanning won't work.
+    #[test]
+    fn test_extract_blob_refs_from_automerge_binary() {
+        use automerge::{AutoCommit, transaction::Transactable};
+
+        let hash1 = blake3::hash(b"image data").to_hex().to_string();
+        let hash2 = blake3::hash(b"pdf data").to_hex().to_string();
+
+        // Simulate what humandocs does: store attachments as a JSON string
+        let attachments_json = serde_json::to_string(&serde_json::json!([
+            {"name": "photo.jpg", "blob_hash": hash1},
+            {"name": "report.pdf", "blob_hash": hash2}
+        ]))
+        .unwrap();
+
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "title", "Test Document").unwrap();
+        doc.put(automerge::ROOT, "attachments", attachments_json.as_str()).unwrap();
+        let bytes = doc.save();
+
+        // Verify raw byte scanning would NOT find the hashes
+        // (Automerge columnar compression obscures them)
+        let byte_scan_results = extract_hashes_from_bytes(&bytes);
+        // This is the bug: byte scanning may find 0 hashes in compressed data
+        eprintln!(
+            "Raw byte scan found {} hashes (expected to miss some or all)",
+            byte_scan_results.len()
+        );
+
+        // The fixed extract_blob_refs should find both hashes
+        let refs = extract_blob_refs(&bytes);
+        assert!(
+            refs.contains(&hash1),
+            "Should find hash1 in Automerge doc. Found: {:?}",
+            refs
+        );
+        assert!(
+            refs.contains(&hash2),
+            "Should find hash2 in Automerge doc. Found: {:?}",
+            refs
+        );
+        assert_eq!(refs.len(), 2, "Should find exactly 2 hashes");
+    }
+
+    /// Test extract_blob_refs finds a hash stored directly as a scalar value
+    #[test]
+    fn test_extract_blob_refs_scalar_hash_in_automerge() {
+        use automerge::{AutoCommit, transaction::Transactable};
+
+        let hash = blake3::hash(b"direct blob").to_hex().to_string();
+
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "attachment_hash", hash.as_str()).unwrap();
+        let bytes = doc.save();
+
+        let refs = extract_blob_refs(&bytes);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], hash);
+    }
+
+    /// Test extract_blob_refs finds blob:HASH references in Text content
+    #[test]
+    fn test_extract_blob_refs_in_text_content() {
+        use automerge::{AutoCommit, ObjType, transaction::Transactable};
+
+        let hash = blake3::hash(b"inline image").to_hex().to_string();
+
+        let mut doc = AutoCommit::new();
+        let text_id = doc.put_object(automerge::ROOT, "content", ObjType::Text).unwrap();
+        let content = format!("Here is an image: ![photo](blob:{})", hash);
+        doc.splice_text(&text_id, 0, 0, &content).unwrap();
+        let bytes = doc.save();
+
+        let refs = extract_blob_refs(&bytes);
+        assert!(
+            refs.contains(&hash),
+            "Should find blob hash in Text content. Found: {:?}",
+            refs
+        );
+    }
+
+    /// Test that extract_blob_refs deduplicates hashes
+    #[test]
+    fn test_extract_blob_refs_deduplicates() {
+        use automerge::{AutoCommit, transaction::Transactable};
+
+        let hash = blake3::hash(b"same blob").to_hex().to_string();
+
+        let attachments_json = serde_json::to_string(&serde_json::json!([
+            {"name": "copy1.jpg", "blob_hash": hash},
+            {"name": "copy2.jpg", "blob_hash": hash}
+        ]))
+        .unwrap();
+
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "attachments", attachments_json.as_str()).unwrap();
+        // Also put the same hash as a direct scalar
+        doc.put(automerge::ROOT, "primary_blob", hash.as_str()).unwrap();
+        let bytes = doc.save();
+
+        let refs = extract_blob_refs(&bytes);
+        assert_eq!(
+            refs.len(),
+            1,
+            "Should deduplicate: found {:?}",
+            refs
+        );
+        assert_eq!(refs[0], hash);
+    }
+
+    /// Test that extract_blob_refs returns empty for a doc with no hashes
+    #[test]
+    fn test_extract_blob_refs_no_hashes() {
+        use automerge::{AutoCommit, transaction::Transactable};
+
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "title", "No attachments here").unwrap();
+        doc.put(automerge::ROOT, "content", "Just plain text").unwrap();
+        let bytes = doc.save();
+
+        let refs = extract_blob_refs(&bytes);
+        assert!(refs.is_empty(), "Should find no hashes: {:?}", refs);
     }
 }
