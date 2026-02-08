@@ -55,7 +55,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 /// Number of consecutive sync failures before a peer is automatically pruned.
-const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const MAX_CONSECUTIVE_FAILURES: u32 = 120;
 
 /// Tag byte for the pairing handshake protocol.
 const PAIR_REQUEST_TAG: u8 = 0xFE;
@@ -906,7 +906,10 @@ impl HumanSync {
                                     }
                                 }
 
-                                // Trigger immediate sync so the new peer's docs are exchanged
+                                // Give the scanner time to finish pairing and add us to their registry
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                                // Trigger sync so the new peer's docs are exchanged
                                 let mut failure_counts = HashMap::new();
                                 Self::run_sync_cycle(
                                     &endpoint,
@@ -1212,6 +1215,7 @@ impl HumanSync {
                     peers_connected += 1;
                     docs_synced += synced_count;
                     total_docs = total_docs.max(doc_count);
+                    // Mark peer as online (connected + synced)
                     let _ = registry.touch(&device.node_id);
                     // Reset failure counter on success
                     failure_counts.remove(&device.node_id);
@@ -1231,21 +1235,16 @@ impl HumanSync {
                         "Failed to sync with peer"
                     );
 
-                    // Prune peer after too many consecutive failures,
-                    // but never prune the server (name == "Server")
-                    if *count >= MAX_CONSECUTIVE_FAILURES
-                        && !device.name.eq_ignore_ascii_case("server")
-                    {
-                        info!(
+                    // Log a warning after many consecutive failures but never
+                    // auto-remove peers — that would permanently break pairing.
+                    // Users can manually remove devices from the UI.
+                    if *count == MAX_CONSECUTIVE_FAILURES {
+                        warn!(
                             peer = %device.node_id,
                             name = %device.name,
                             failures = *count,
-                            "Removing peer after repeated connection failures"
+                            "Peer unreachable for extended period"
                         );
-                        if let Err(e) = registry.remove(&device.node_id) {
-                            warn!(error = %e, "Failed to remove stale peer from registry");
-                        }
-                        failure_counts.remove(&device.node_id);
                     }
                 }
             }
