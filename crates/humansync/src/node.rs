@@ -629,13 +629,11 @@ impl HumanSync {
         let pin_hash: [u8; 32] = Sha256::digest(pin.as_bytes()).into();
         let my_name = self.config.device_name.as_bytes();
 
-        // Add the remote to our registry first
-        self.registry
-            .add(crate::registry::DeviceInfo::new(*remote_node_id, remote_name_hint))
-            .map_err(|e| Error::pairing(format!("failed to add remote to registry: {e}")))?;
-        self.registry
-            .save()
-            .map_err(|e| Error::pairing(format!("failed to save registry: {e}")))?;
+        // NOTE: Do NOT add the remote to the registry before connecting.
+        // If we did, the listener's background sync might connect to us,
+        // and our accept loop would route it to handle_incoming_connection
+        // (since we'd be in the listener's registry). Instead, we add the
+        // remote only after the handshake succeeds.
 
         // Connect to remote with timeout
         let conn = tokio::time::timeout(
@@ -673,9 +671,6 @@ impl HumanSync {
             .map_err(|e| Error::pairing(format!("failed to read pairing response: {e}")))?;
 
         if response_tag[0] == 0x00 {
-            // Rejected -- remove the remote we just added
-            let _ = self.registry.remove(remote_node_id);
-            let _ = self.registry.save();
             return Err(Error::pairing("PIN rejected by remote device"));
         }
 
@@ -697,11 +692,10 @@ impl HumanSync {
         let peer_name = String::from_utf8(peer_name_buf)
             .unwrap_or_else(|_| remote_name_hint.to_string());
 
-        // Update the registry entry with the confirmed name from the peer
-        let _ = self.registry.remove(remote_node_id);
+        // Now add the remote to our registry (only after successful handshake)
         self.registry
             .add(crate::registry::DeviceInfo::new(*remote_node_id, &peer_name))
-            .map_err(|e| Error::pairing(format!("failed to update registry: {e}")))?;
+            .map_err(|e| Error::pairing(format!("failed to add peer to registry: {e}")))?;
         self.registry
             .save()
             .map_err(|e| Error::pairing(format!("failed to save registry: {e}")))?;
