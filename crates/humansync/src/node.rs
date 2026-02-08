@@ -44,14 +44,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use iroh::{Endpoint, NodeAddr, NodeId, SecretKey};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
-use tokio::sync::{oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{oneshot, watch, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
 /// Number of consecutive sync failures before a peer is automatically pruned.
@@ -124,6 +124,12 @@ pub struct SyncStatus {
     ///
     /// `None` if no sync has completed yet since node initialization.
     pub last_sync: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// Monotonically increasing counter bumped whenever documents change via sync.
+    ///
+    /// Incremented both after outbound sync cycles and when incoming doc syncs
+    /// complete, so the frontend can detect changes without counting documents.
+    pub generation: u64,
 }
 
 /// Internal state of the node
@@ -561,14 +567,16 @@ impl HumanSync {
     pub async fn sync_now(&self) -> Result<()> {
         let endpoint = self.endpoint().ok_or(Error::Shutdown)?;
 
-        // Manual sync uses a temporary failure counter (doesn't accumulate across calls)
+        // Manual sync uses temporary counters (doesn't accumulate across calls)
         let mut failure_counts = HashMap::new();
+        let mut last_attempt = HashMap::new();
         Self::run_sync_cycle(
             &endpoint,
             &self.store,
             &self.registry,
             &self.sync_status,
             &mut failure_counts,
+            &mut last_attempt,
         )
         .await;
 
@@ -866,8 +874,10 @@ impl HumanSync {
                     info!(remote = %remote_node_id, "Accepted P2P connection");
 
                     let store = store.clone();
+                    let sync_status = sync_status.clone();
+                    let endpoint = endpoint.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_incoming_connection(conn, store).await {
+                        if let Err(e) = Self::handle_incoming_connection(conn, store, sync_status, endpoint).await {
                             debug!(remote = %remote_node_id, error = %e, "Incoming connection handler finished");
                         }
                     });
@@ -911,12 +921,14 @@ impl HumanSync {
 
                                 // Trigger sync so the new peer's docs are exchanged
                                 let mut failure_counts = HashMap::new();
+                                let mut last_attempt = HashMap::new();
                                 Self::run_sync_cycle(
                                     &endpoint,
                                     &store,
                                     &registry,
                                     &sync_status,
                                     &mut failure_counts,
+                                    &mut last_attempt,
                                 )
                                 .await;
                                 info!("Post-pairing sync completed (acceptor side)");
@@ -939,7 +951,10 @@ impl HumanSync {
     async fn handle_incoming_connection(
         conn: iroh::endpoint::Connection,
         store: Arc<Store>,
+        sync_status: Arc<RwLock<SyncStatus>>,
+        endpoint: Endpoint,
     ) -> Result<()> {
+        let remote_node_id = conn.remote_node_id().ok();
         loop {
             let (send, mut recv) = match conn.accept_bi().await {
                 Ok(streams) => streams,
@@ -972,8 +987,14 @@ impl HumanSync {
                 }
                 first_byte => {
                     // Doc sync — first byte is part of the doc name length prefix
+                    let sync_status = sync_status.clone();
+                    let endpoint = endpoint.clone();
+                    let remote_node_id = remote_node_id;
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_incoming_doc_sync(store, send, recv, first_byte).await {
+                        if let Err(e) = Self::handle_incoming_doc_sync(
+                            store, send, recv, first_byte, sync_status,
+                            endpoint, remote_node_id,
+                        ).await {
                             debug!(error = %e, "Incoming doc sync finished");
                         }
                     });
@@ -989,6 +1010,9 @@ impl HumanSync {
         send: iroh::endpoint::SendStream,
         mut recv: iroh::endpoint::RecvStream,
         first_byte: u8,
+        sync_status: Arc<RwLock<SyncStatus>>,
+        endpoint: Endpoint,
+        remote_node_id: Option<iroh::NodeId>,
     ) -> Result<()> {
         // Read remaining 3 bytes of the 4-byte doc name length
         let mut remaining_len = [0u8; 3];
@@ -1030,6 +1054,34 @@ impl HumanSync {
             .await
             .map_err(|e| Error::sync(format!("failed to save synced document: {e}")))?;
 
+        // Fetch any blob attachments referenced by the synced document
+        if let Some(peer_id) = remote_node_id {
+            let doc_bytes = local_doc.save_bytes();
+            let blob_refs = crate::sync::blobs::extract_blob_refs(&doc_bytes);
+            if !blob_refs.is_empty() {
+                if let Some(blob_store) = store.blob_store() {
+                    let peer_addr = iroh::NodeAddr::new(peer_id);
+                    match crate::sync::blobs::sync_blobs_with_peer(
+                        &blob_store, &endpoint, &peer_addr, &blob_refs,
+                    ).await {
+                        Ok(count) if count > 0 => {
+                            info!(doc = %doc_name, count, "Fetched blobs after incoming doc sync");
+                        }
+                        Err(e) => {
+                            warn!(doc = %doc_name, error = %e, "Failed to fetch blobs after incoming doc sync");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Bump generation so the frontend detects the change on next poll
+        {
+            let mut status = sync_status.write();
+            status.generation += 1;
+        }
+
         info!(doc = %doc_name, "Incoming doc sync completed");
         Ok(())
     }
@@ -1054,6 +1106,7 @@ impl HumanSync {
             );
 
             let mut failure_counts: HashMap<NodeId, u32> = HashMap::new();
+            let mut last_attempt: HashMap<NodeId, Instant> = HashMap::new();
 
             loop {
                 // Use tokio::select! for cancellation
@@ -1068,7 +1121,7 @@ impl HumanSync {
                     // Sleep for the sync interval
                     _ = tokio::time::sleep(sync_interval) => {
                         // Run a sync cycle
-                        Self::run_sync_cycle(&endpoint, &store, &registry, &sync_status, &mut failure_counts).await;
+                        Self::run_sync_cycle(&endpoint, &store, &registry, &sync_status, &mut failure_counts, &mut last_attempt).await;
                     }
                 }
             }
@@ -1183,6 +1236,7 @@ impl HumanSync {
         registry: &Arc<DeviceRegistryStore>,
         sync_status: &Arc<RwLock<SyncStatus>>,
         failure_counts: &mut HashMap<NodeId, u32>,
+        last_attempt: &mut HashMap<NodeId, Instant>,
     ) {
         debug!("Starting sync cycle");
 
@@ -1204,6 +1258,10 @@ impl HumanSync {
         let mut docs_synced = 0;
         let mut total_docs = 0usize;
 
+        // Collect peers eligible for sync (applying backoff filter)
+        let now = Instant::now();
+        let mut peers_to_sync = Vec::new();
+
         for device in &devices {
             // Skip ourselves
             if device.node_id == my_node_id {
@@ -1216,27 +1274,80 @@ impl HumanSync {
                 continue;
             }
 
-            // Try to sync with this peer
-            match Self::sync_with_peer(endpoint, store, &device.node_id).await {
+            // Exponential backoff: skip peers that failed recently
+            if let Some(&failures) = failure_counts.get(&device.node_id) {
+                if failures > 0 {
+                    if let Some(&last) = last_attempt.get(&device.node_id) {
+                        let backoff_secs = (1u64 << failures.min(8)).min(300);
+                        let elapsed = now.duration_since(last);
+                        if elapsed < Duration::from_secs(backoff_secs) {
+                            debug!(
+                                peer = %device.node_id,
+                                failures,
+                                backoff_secs,
+                                remaining_secs = (Duration::from_secs(backoff_secs) - elapsed).as_secs(),
+                                "Skipping peer due to exponential backoff"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            peers_to_sync.push(device.node_id);
+        }
+
+        // Sync with peers concurrently using JoinSet, capped at 5 concurrent tasks
+        let semaphore = Arc::new(Semaphore::new(5));
+        let mut join_set = JoinSet::new();
+
+        for peer_node_id in &peers_to_sync {
+            let endpoint = endpoint.clone();
+            let store = store.clone();
+            let sem = semaphore.clone();
+            let peer = *peer_node_id;
+
+            // Record attempt time before spawning
+            last_attempt.insert(peer, Instant::now());
+
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                let result = Self::sync_with_peer(&endpoint, &store, &peer).await;
+                (peer, result)
+            });
+        }
+
+        // Collect all results
+        while let Some(join_result) = join_set.join_next().await {
+            let (peer_node_id, sync_result) = match join_result {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "Sync task panicked");
+                    continue;
+                }
+            };
+
+            match sync_result {
                 Ok((synced_count, doc_count)) => {
                     peers_connected += 1;
                     docs_synced += synced_count;
                     total_docs = total_docs.max(doc_count);
                     // Mark peer as online (connected + synced)
-                    let _ = registry.touch(&device.node_id);
-                    // Reset failure counter on success
-                    failure_counts.remove(&device.node_id);
+                    let _ = registry.touch(&peer_node_id);
+                    // Reset failure counter and last_attempt on success
+                    failure_counts.remove(&peer_node_id);
+                    last_attempt.remove(&peer_node_id);
                     debug!(
-                        peer = %device.node_id,
+                        peer = %peer_node_id,
                         docs_synced = synced_count,
                         "Sync with peer completed"
                     );
                 }
                 Err(e) => {
-                    let count = failure_counts.entry(device.node_id).or_insert(0);
+                    let count = failure_counts.entry(peer_node_id).or_insert(0);
                     *count += 1;
                     warn!(
-                        peer = %device.node_id,
+                        peer = %peer_node_id,
                         consecutive_failures = *count,
                         error = %e,
                         "Failed to sync with peer"
@@ -1247,8 +1358,7 @@ impl HumanSync {
                     // Users can manually remove devices from the UI.
                     if *count == MAX_CONSECUTIVE_FAILURES {
                         warn!(
-                            peer = %device.node_id,
-                            name = %device.name,
+                            peer = %peer_node_id,
                             failures = *count,
                             "Peer unreachable for extended period"
                         );
@@ -1269,6 +1379,9 @@ impl HumanSync {
                     status.docs_pending = total_docs - docs_synced;
                 }
                 status.last_sync = Some(Utc::now());
+                if docs_synced > 0 {
+                    status.generation += 1;
+                }
             }
         }
 
@@ -1401,8 +1514,8 @@ impl HumanSync {
                 docs
             }
             Err(first_err) => {
-                warn!(peer = %peer_node_id, error = %first_err, "Failed to get remote doc list, retrying in 1s");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                warn!(peer = %peer_node_id, error = %first_err, "Failed to get remote doc list, retrying in 200ms");
+                tokio::time::sleep(Duration::from_millis(200)).await;
                 match request_doc_list(&conn).await {
                     Ok(docs) => {
                         debug!(peer = %peer_node_id, count = docs.len(), "Received remote doc list on retry");
