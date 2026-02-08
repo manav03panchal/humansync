@@ -1085,7 +1085,7 @@ impl HumanSync {
     ///
     /// Returns the number of documents migrated.
     pub async fn migrate_vault_docs(&self) -> Result<usize> {
-        let vaults_doc_name = "_vaults.automerge";
+        let vaults_doc_name = "_vaults";
         let doc = match self.store.open_doc(vaults_doc_name).await {
             Ok(d) => d,
             Err(_) => return Ok(0), // No shared vault doc yet
@@ -1186,6 +1186,13 @@ impl HumanSync {
     ) {
         debug!("Starting sync cycle");
 
+        // Reload registry from disk BEFORE checking for devices.
+        // Incoming sync may have updated _devices.automerge on disk
+        // while our in-memory registry was still empty.
+        if let Err(e) = registry.reload_from_disk() {
+            warn!(error = %e, "Failed to reload device registry at start of sync cycle");
+        }
+
         let devices = registry.list();
         if devices.is_empty() {
             debug!("No devices in registry, skipping sync");
@@ -1276,7 +1283,7 @@ impl HumanSync {
         {
             // Build a temporary HumanSync-like context to call migrate_vault_docs.
             // We only need store access, which we already have.
-            let vaults_doc_name = "_vaults.automerge";
+            let vaults_doc_name = "_vaults";
             if let Ok(doc) = store.open_doc(vaults_doc_name).await {
                 if let Ok(keys) = doc.keys() {
                     if !keys.is_empty() {

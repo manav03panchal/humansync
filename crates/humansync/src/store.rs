@@ -660,8 +660,12 @@ impl Store {
     fn path_to_doc_name(&self, path: &Path) -> Option<String> {
         let relative = path.strip_prefix(&self.docs_path).ok()?;
         let name = relative.to_str()?;
-        // Remove file extension if present
-        Some(name.trim_end_matches(".automerge").to_string())
+        // Remove the .automerge extension (once, not repeatedly)
+        Some(
+            name.strip_suffix(".automerge")
+                .unwrap_or(name)
+                .to_string(),
+        )
     }
 
     /// Get the path for a document
