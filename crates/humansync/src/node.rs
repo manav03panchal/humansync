@@ -1596,6 +1596,7 @@ impl HumanSync {
         all_blob_hashes.dedup();
 
         if !all_blob_hashes.is_empty() {
+            info!(count = all_blob_hashes.len(), "Blob refs found in documents, syncing...");
             if let Some(blob_store) = store.blob_store() {
                 let peer_node_addr = NodeAddr::new(*peer_node_id);
                 match crate::sync::blobs::sync_blobs_with_peer(
@@ -1607,12 +1608,16 @@ impl HumanSync {
                 .await
                 {
                     Ok(count) => {
-                        debug!(count, "Blobs synced from peer");
+                        if count > 0 {
+                            info!(count, "Blobs fetched from peer");
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to sync blobs from peer");
                     }
                 }
+            } else {
+                warn!("Blob store not initialized — skipping blob sync");
             }
         }
 
