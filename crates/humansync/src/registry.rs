@@ -443,7 +443,31 @@ impl DeviceRegistryStore {
         match AutoCommit::load(&bytes) {
             Ok(loaded_doc) => {
                 let devices = Self::extract_devices_from_doc(&loaded_doc)?;
+
+                // Preserve locally-observed last_seen timestamps before reload.
+                // The on-disk doc may have stale last_seen from remote peers,
+                // while our in-memory registry has fresh values from touch().
+                let prev_last_seen: HashMap<NodeId, DateTime<Utc>> = self
+                    .registry
+                    .list()
+                    .into_iter()
+                    .map(|d| (d.node_id, d.last_seen))
+                    .collect();
+
                 self.registry.load_from_doc(devices.clone());
+
+                // Restore any last_seen that was more recent in memory
+                {
+                    let mut reg = self.registry.devices.write();
+                    for (node_id, local_ts) in &prev_last_seen {
+                        if let Some(info) = reg.get_mut(node_id) {
+                            if *local_ts > info.last_seen {
+                                info.last_seen = *local_ts;
+                            }
+                        }
+                    }
+                }
+
                 *self.doc.write() = loaded_doc;
                 *self.dirty.write() = false;
                 debug!(
