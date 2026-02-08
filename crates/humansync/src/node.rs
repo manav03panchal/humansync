@@ -661,8 +661,7 @@ impl HumanSync {
         send.write_all(&payload)
             .await
             .map_err(|e| Error::pairing(format!("failed to send pairing request: {e}")))?;
-        send.finish()
-            .map_err(|e| Error::pairing(format!("failed to finish send: {e}")))?;
+        // Don't finish() yet — acceptor waits for our FIN as confirmation we read the response
 
         // Read response: first byte is accept/reject
         let mut response_tag = [0u8; 1];
@@ -671,6 +670,7 @@ impl HumanSync {
             .map_err(|e| Error::pairing(format!("failed to read pairing response: {e}")))?;
 
         if response_tag[0] == 0x00 {
+            send.finish().ok();
             return Err(Error::pairing("PIN rejected by remote device"));
         }
 
@@ -691,6 +691,10 @@ impl HumanSync {
 
         let peer_name = String::from_utf8(peer_name_buf)
             .unwrap_or_else(|_| remote_name_hint.to_string());
+
+        // Now finish our send stream — signals to acceptor that we received the response
+        send.finish()
+            .map_err(|e| Error::pairing(format!("failed to finish send: {e}")))?;
 
         // Now add the remote to our registry (only after successful handshake)
         self.registry
@@ -797,6 +801,15 @@ impl HumanSync {
             .map_err(|e| Error::pairing(format!("failed to send acceptance: {e}")))?;
         send.finish()
             .map_err(|e| Error::pairing(format!("failed to finish stream: {e}")))?;
+
+        // Wait for scanner to close its send stream (FIN), confirming it received our response.
+        // Without this, returning drops the Connection which sends CONNECTION_CLOSE before
+        // our response data reaches the scanner, causing "connection lost" on their side.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            recv.read_to_end(256),
+        )
+        .await;
 
         info!(remote = %remote_node_id, name = %remote_name, "Pairing completed (acceptor side)");
 
