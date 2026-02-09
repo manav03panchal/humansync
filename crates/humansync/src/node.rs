@@ -1565,14 +1565,22 @@ impl HumanSync {
                 }
             };
 
-            // Sync this document with the peer
+            // Sync this document with the peer.
+            // Compare heads before/after to detect if the peer sent new data.
+            // Only save to disk when something actually changed — otherwise we'd
+            // overwrite concurrent local edits (e.g. save_document) with a stale
+            // snapshot that was loaded before the edit.
+            let heads_before = local_doc.get_heads();
             match sync_docs(&conn, &local_doc).await {
                 Ok(()) => {
-                    // Save the synced document
-                    if let Err(e) = local_doc.save() {
-                        error!(doc = %doc_name, error = %e, "Failed to save synced document");
-                    } else {
-                        synced_count += 1;
+                    let heads_after = local_doc.get_heads();
+                    if heads_before != heads_after {
+                        // Received new changes from peer — persist them
+                        if let Err(e) = local_doc.save() {
+                            error!(doc = %doc_name, error = %e, "Failed to save synced document");
+                        } else {
+                            synced_count += 1;
+                        }
                     }
                 }
                 Err(e) => {
